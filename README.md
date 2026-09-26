@@ -21,7 +21,8 @@ single stream:
 
 | | decode |
 |---|---|
-| TabbyAPI (OpenAI endpoint, temperature 0.6), MTP drafting (2 tokens), placement adapted | **74 tok/s** code, **50 tok/s** prose (TTFT ~0.4 s) |
+| TabbyAPI (OpenAI endpoint, temperature 0.6), MTP drafting (2 tokens), learned placement | **83 tok/s** code, 45-50 tok/s prose (TTFT ~0.4 s) |
+| TabbyAPI, MTP, 28.7K-token code prompt | prefill 505 tok/s cold (TTFT 57 s), 0.25 s TTFT on the cached prefix, decode 51-70 tok/s |
 | TabbyAPI, no drafting, placement adapted | 53 tok/s code, 46 tok/s prose |
 | TabbyAPI, MTP, first request after load (general-purpose placement) | 52 tok/s code, 45 tok/s prose |
 | exllamav3 generator (`rocm_tests/moe_gen.py`), general-purpose placement | 46 tok/s code and prose |
