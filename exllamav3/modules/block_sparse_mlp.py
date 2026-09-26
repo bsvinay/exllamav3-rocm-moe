@@ -72,6 +72,10 @@ _routing_check = os.environ.get("EXL3_TP_ROUTING_CHECK", "0") != "0"
 _moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
 # EXL3_MOE_BSZN=0 disables the fused decode kernels (BC_BlockSparseMLP.run_bszN), for A/B tests
 _bszn_enable = os.environ.get("EXL3_MOE_BSZN", "1") != "0"
+# RDNA3: routed experts of decode-sized batches through exl3_rdna3_moe_decode (two matmul launches per
+# layer, no host sync); EXL3_RDNA3_MOE=0 falls back to the generic paths
+_rdna3_moe_enable = bool(torch.version.hip) and os.environ.get("EXL3_RDNA3_MOE", "1") != "0"
+RDNA3_MOE_MAX_TOKENS = 16
 
 # Router types whose selection runs entirely on the deterministic ext paths (routing_gemm.cu +
 # fixed-order top-k with FMA-only activations), so under tensor parallelism every rank can route
@@ -942,8 +946,51 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             handled.update(grp)
         return handled
 
+    def _rdna3_moe_ready(self) -> bool:
+        st = getattr(self, "_rdna3_moe_state", None)
+        if st is None:
+            ok = (
+                self.gated and self.activation_fn == "silu" and self.is_quantized and
+                getattr(self, "support_quant_paths", False) and
+                self.multi_gate is not None and self.multi_up is not None and self.multi_down is not None and
+                self.multi_gate.K == self.multi_up.K and self.act_limit in (None, 0, 0.0) and
+                self.multi_up.mcg == self.multi_down.mcg and self.multi_up.mul1 == self.multi_down.mul1 and
+                self.device is not None and self.device.type == "cuda"
+            )
+            st = self._rdna3_moe_state = {"ok": ok}
+            if ok:
+                pmax = RDNA3_MOE_MAX_TOKENS * self.num_experts_per_tok
+                I = self.multi_up.out_features
+                H = self.multi_down.out_features
+                st["tabs"] = g_tensor_cache.get(self.device, (6 * pmax,), torch.long, "rdna3_moe_tabs")
+                st["c_gu"] = g_tensor_cache.get(self.device, (2 * pmax, I), torch.half, "rdna3_moe_c_gu")
+                st["c_d"] = g_tensor_cache.get(self.device, (pmax, H), torch.float, "rdna3_moe_c_d")
+                st["out"] = g_tensor_cache.get(self.device, (RDNA3_MOE_MAX_TOKENS, H), torch.float, "rdna3_moe_out")
+        return st["ok"]
+
+    def _rdna3_moe_forward(self, y, bsz, selected_experts, routing_weights, eshape):
+        st = self._rdna3_moe_state
+        sel = selected_experts
+        if self.routing_first and self.num_local_experts != self.num_experts:
+            sel = sel - self.routing_first
+        w = routing_weights if routing_weights.dtype == torch.half else routing_weights.half()
+        out = st["out"][:bsz]
+        mg, mu, md = self.multi_gate, self.multi_up, self.multi_down
+        ok = ext.exl3_rdna3_moe_decode(
+            y.contiguous(), sel.contiguous(), w.contiguous(),
+            mg.ptrs_trellis, mg.ptrs_suh, mg.ptrs_svh,
+            mu.ptrs_trellis, mu.ptrs_suh, mu.ptrs_svh,
+            md.ptrs_trellis, md.ptrs_suh, md.ptrs_svh,
+            float(mu.K), float(md.K), bool(mu.mcg), bool(mu.mul1),
+            self.num_local_experts or self.num_experts,
+            st["tabs"], st["c_gu"], st["c_d"], out,
+        )
+        assert ok, "exl3_rdna3_moe_decode declined a shape it was set up for"
+        return out.view(eshape)
+
     @override
     def unload(self):
+        self._rdna3_moe_state = None
         self.cpu_unload()
         self.bc = None
         self.fused_mode_buffers = None
@@ -1039,6 +1086,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if check:
                 _routing_check_compare(self.key, local_sel, local_w, selected_experts, routing_weights)
 
+        rdna3_moe = _rdna3_moe_enable and bsz <= RDNA3_MOE_MAX_TOKENS and self._rdna3_moe_ready()
+
         # CPU expert offload (block_sparse_mlp_cpu.py): split layers hand the tail experts'
         # share to the worker now so it computes concurrently with the GPU expert paths below
         # (folded back in by cpu_split_combine); whole-layer offload replaces the routed sum
@@ -1053,6 +1102,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
+
+        # RDNA3 decode path
+        elif rdna3_moe:
+            final_hidden_states = self._rdna3_moe_forward(y, bsz, selected_experts, routing_weights, eshape)
 
         # Torch/C++/fused path
         elif (

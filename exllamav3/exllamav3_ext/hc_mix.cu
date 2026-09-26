@@ -468,6 +468,219 @@ void gr_finalize_kernel
 
 
 
+
+// ---------------------------------------------------------------------------------------------
+// RDNA3 decode mix (R <= GR3_MAX_R): the NVIDIA-tuned kernels above run at ~90 GB/s on gfx1100
+// (few waves, each serializing a long register-resident chunk loop). Here phase A is one wave per
+// (fn row, stream) with its 8 x NCH halves in flight and the rows looped against the L2-resident
+// streams, a one-block head kernel derives rmr / the silu'd latent / post once, and phase B is one
+// wave per (column quad, stream) with the per-stream gates combined through LDS. 154 -> 26 us per
+// site at one row (Qwen3.8-Flash-Next, 13 MB of fp16 tables per site).
+#ifdef __HIP_PLATFORM_AMD__
+#define GR3_MAX_R 8
+namespace gr3 {
+
+template <int NCH>
+__global__ __launch_bounds__(256)
+void dots_kernel(const float* __restrict__ streams, const half* __restrict__ fn, float* __restrict__ dots,
+                 const int M, const int D, const int R)
+{
+    constexpr int H = 4;
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int h = w & 3;
+    const int nb = (M + 1) / 2;
+    if ((int) blockIdx.x >= nb)
+    {
+        // Sums of squares, one wave per (row, stream)
+        for (int r = w >> 2; r < R; r += 2)
+        {
+            const float4* s4 = (const float4*) (streams + ((size_t) r * H + h) * D);
+            float a = 0.0f;
+            for (int c = lane; c < D / 4; c += 32)
+            {
+                const float4 s = s4[c];
+                a = fmaf(s.x, s.x, fmaf(s.y, s.y, fmaf(s.z, s.z, fmaf(s.w, s.w, a))));
+            }
+            for (int o = 16; o > 0; o >>= 1) a += __shfl_xor(a, o);
+            if (lane == 0) dots[((size_t) r * (M + 1) + M) * H + h] = a;
+        }
+        return;
+    }
+    const int j = blockIdx.x * 2 + (w >> 2);
+    if (j >= M) return;
+    const int4* f8 = (const int4*) (fn + ((size_t) j * H + h) * D);
+    int4 f[NCH];
+    #pragma unroll
+    for (int k = 0; k < NCH; ++k) f[k] = f8[lane + 32 * k];
+    for (int r = 0; r < R; ++r)
+    {
+        const float4* s4 = (const float4*) (streams + ((size_t) r * H + h) * D);
+        float a = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < NCH; ++k)
+        {
+            const int c = lane + 32 * k;
+            const float4 s0 = s4[2 * c], s1 = s4[2 * c + 1];
+            const half2* w2 = (const half2*) &f[k];
+            const float2 w0 = __half22float2(w2[0]), w1 = __half22float2(w2[1]);
+            const float2 w2f = __half22float2(w2[2]), w3 = __half22float2(w2[3]);
+            a = fmaf(s0.x, w0.x, a); a = fmaf(s0.y, w0.y, a); a = fmaf(s0.z, w1.x, a); a = fmaf(s0.w, w1.y, a);
+            a = fmaf(s1.x, w2f.x, a); a = fmaf(s1.y, w2f.y, a); a = fmaf(s1.z, w3.x, a); a = fmaf(s1.w, w3.y, a);
+        }
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor(a, o);
+        if (lane == 0) dots[((size_t) r * (M + 1) + j) * H + h] = a;
+    }
+}
+
+// rmr (R, H), silu'd latent t (R, LR) and the optional inject gates, once per site
+__global__ __launch_bounds__(256)
+void head_kernel(const float* __restrict__ dots, float* __restrict__ t, float* __restrict__ rmr, float* __restrict__ post,
+                 const int M, const int D, const int LR, const int R, const float rms_eps)
+{
+    constexpr int H = 4;
+    __shared__ float rm[GR3_MAX_R * H];
+    for (int i = threadIdx.x; i < R * H; i += 256)
+    {
+        const int r = i / H, h = i % H;
+        rm[i] = rsqrtf(dots[((size_t) r * (M + 1) + M) * H + h] / (float) D + rms_eps);
+        rmr[i] = rm[i];
+    }
+    __syncthreads();
+    const float inv_h = 1.0f / (float) H;
+    for (int idx = threadIdx.x; idx < R * LR; idx += 256)
+    {
+        const int r = idx / LR, i = idx % LR;
+        const float* dr = dots + ((size_t) r * (M + 1) + i) * H;
+        float v = 0.0f;
+        #pragma unroll
+        for (int h = 0; h < H; ++h) v = fmaf(rm[r * H + h], dr[h], v);
+        v *= inv_h;
+        t[idx] = v * sigmoidf_(v);
+    }
+    if (post)
+        for (int i = threadIdx.x; i < R * H; i += 256)
+        {
+            const int r = i / H, h = i % H;
+            const float* dr = dots + ((size_t) r * (M + 1) + LR + h) * H;
+            float v = 0.0f;
+            #pragma unroll
+            for (int hh = 0; hh < H; ++hh) v = fmaf(rm[r * H + hh], dr[hh], v);
+            post[i] = 2.0f * sigmoidf_(v * inv_h);
+        }
+}
+
+// Two column quads per block, one wave per (quad, stream): the (stream, quad) up slab is LR x 4
+// contiguous halves, lane l holding ranks 64 it + 2 l, +1
+template <int NIT, bool HALF_OUT>
+__global__ __launch_bounds__(256)
+void finalize_kernel(const float* __restrict__ streams, const float* __restrict__ tg, const float* __restrict__ rmr,
+                     const half* __restrict__ upt, const half* __restrict__ w, void* __restrict__ mixed,
+                     const int D, const int R)
+{
+    constexpr int H = 4, QPB = 2, LR = NIT * 64;
+    __shared__ float ts[GR3_MAX_R * LR];
+    __shared__ float4 gs[QPB][H];
+    for (int i = threadIdx.x; i < R * LR; i += 256) ts[i] = tg[i];
+    __syncthreads();
+    const int wv = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int q = wv >> 2, h = wv & 3;
+    const int c = blockIdx.x * QPB + q;
+    const int D4 = D / 4;
+    int4 u[NIT];
+    #pragma unroll
+    for (int it = 0; it < NIT; ++it)
+        u[it] = *(const int4*) (upt + (((size_t) h * D4 + c) * LR + it * 64 + lane * 2) * 4);
+    const float inv_h = 1.0f / (float) H;
+    for (int r = 0; r < R; ++r)
+    {
+        float4 g = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        #pragma unroll
+        for (int it = 0; it < NIT; ++it)
+        {
+            const int i0 = it * 64 + lane * 2;
+            const float t0 = ts[r * LR + i0], t1 = ts[r * LR + i0 + 1];
+            const half2* u2 = (const half2*) &u[it];
+            const float2 a0 = __half22float2(u2[0]), a1 = __half22float2(u2[1]);
+            const float2 b0 = __half22float2(u2[2]), b1 = __half22float2(u2[3]);
+            g.x = fmaf(t0, a0.x, fmaf(t1, b0.x, g.x));
+            g.y = fmaf(t0, a0.y, fmaf(t1, b0.y, g.y));
+            g.z = fmaf(t0, a1.x, fmaf(t1, b1.x, g.z));
+            g.w = fmaf(t0, a1.y, fmaf(t1, b1.y, g.w));
+        }
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            g.x += __shfl_xor(g.x, o); g.y += __shfl_xor(g.y, o);
+            g.z += __shfl_xor(g.z, o); g.w += __shfl_xor(g.w, o);
+        }
+        if (lane == 0)
+        {
+            const float4 sv = ((const float4*) (streams + ((size_t) r * H + h) * D))[c];
+            const half2* wq = (const half2*) (w + (size_t) h * D + 4 * c);
+            const float2 w0 = __half22float2(wq[0]), w1 = __half22float2(wq[1]);
+            const float coef = rmr[r * H + h] * inv_h;
+            gs[q][h] = make_float4(sigmoidf_(g.x) * coef * w0.x * sv.x, sigmoidf_(g.y) * coef * w0.y * sv.y,
+                                   sigmoidf_(g.z) * coef * w1.x * sv.z, sigmoidf_(g.w) * coef * w1.y * sv.w);
+        }
+        __syncthreads();
+        if (h == 0 && lane == 0)
+        {
+            float4 o = gs[q][0];
+            #pragma unroll
+            for (int hh = 1; hh < H; ++hh) { const float4 v = gs[q][hh]; o.x += v.x; o.y += v.y; o.z += v.z; o.w += v.w; }
+            if (HALF_OUT)
+            {
+                half2* out2 = (half2*) ((half*) mixed + (size_t) r * D);
+                out2[c * 2] = __floats2half2_rn(o.x, o.y);
+                out2[c * 2 + 1] = __floats2half2_rn(o.z, o.w);
+            }
+            else
+                ((float4*) ((float*) mixed + (size_t) r * D))[c] = o;
+        }
+        __syncthreads();
+    }
+}
+
+float* g_scratch[16] = {};   // per device: t (GR3_MAX_R, 1024) and rmr (GR3_MAX_R, 4)
+
+// Returns false if the shape is not covered
+bool launch(const float* s_p, const half* fn_p, const half* up_p, const half* w_p, float* dots_p, float* post_p,
+            void* mixed_p, bool hout, int R, int M, int D, int LR, float rms_eps, cudaStream_t stream)
+{
+    if (R > GR3_MAX_R || LR % 64 || LR > 1024 || D % 256) return false;
+    const int nch = D / 256, nit = LR / 64;
+    if (!(nch == 10 || nch == 16 || nch == 20) || !(nit == 5 || nit == 8 || nit == 16)) return false;
+    int device;
+    cuda_check(cudaGetDevice(&device));
+    if (device >= 16) return false;
+    if (!g_scratch[device]) cuda_check(cudaMalloc(&g_scratch[device], (GR3_MAX_R * 1024 + GR3_MAX_R * 4) * sizeof(float)));
+    float* t_p = g_scratch[device];
+    float* rmr_p = t_p + GR3_MAX_R * 1024;
+    const int grid_a = (M + 1) / 2 + 1;
+    switch (nch)
+    {
+        case 10: dots_kernel<10><<<grid_a, 256, 0, stream>>>(s_p, fn_p, dots_p, M, D, R); break;
+        case 16: dots_kernel<16><<<grid_a, 256, 0, stream>>>(s_p, fn_p, dots_p, M, D, R); break;
+        case 20: dots_kernel<20><<<grid_a, 256, 0, stream>>>(s_p, fn_p, dots_p, M, D, R); break;
+    }
+    head_kernel<<<1, 256, 0, stream>>>(dots_p, t_p, rmr_p, post_p, M, D, LR, R, rms_eps);
+    const int grid_c = D / 4 / 2;
+    #define GR3_FIN(NIT) \
+        if (hout) finalize_kernel<NIT, true><<<grid_c, 256, 0, stream>>>(s_p, t_p, rmr_p, up_p, w_p, mixed_p, D, R); \
+        else      finalize_kernel<NIT, false><<<grid_c, 256, 0, stream>>>(s_p, t_p, rmr_p, up_p, w_p, mixed_p, D, R);
+    switch (nit)
+    {
+        case 5:  GR3_FIN(5) break;
+        case 8:  GR3_FIN(8) break;
+        case 16: GR3_FIN(16) break;
+    }
+    #undef GR3_FIN
+    cuda_check(cudaPeekAtLastError());
+    return true;
+}
+
+}  // namespace gr3
+#endif
+
 // ---------------------------------------------------------------------------------------------
 // Decode mix, bytes-in-flight version (benchmarks/gr_mix_decode): the fn table is read once per
 // site for all rows, with each lane's chunks of GR_J rows issued together, one warp per stream;
@@ -1043,6 +1256,13 @@ void gr_mix
     TORCH_CHECK(M == LR + (post ? H : 0), "gr_mix: fn rows must be LR (+ H with post)");
     TORCH_CHECK(fn.size(1) == H * D && w.numel() == H * D, "gr_mix: dims");
     TORCH_CHECK(dots.size(0) == R && dots.size(1) == M + 1 && dots.size(2) == H, "gr_mix: dots shape");
+
+    #ifdef __HIP_PLATFORM_AMD__
+    if (gr3::launch((const float*) streams.data_ptr(), (const half*) fn.data_ptr(), (const half*) upt.data_ptr(),
+                    (const half*) w.data_ptr(), (float*) dots.data_ptr(), post ? (float*) post.value().data_ptr() : nullptr,
+                    mixed.data_ptr(), mixed.dtype() == at::kHalf, R, M, D, LR, (float) rms_eps, stream))
+        return;
+    #endif
 
     const int nch = D / 256, nit = (LR + 63) / 64;
     const bool fast = R <= GR_MAX_R && D % 256 == 0 && (nch == 10 || nch == 16 || nch == 20) && (nit == 5 || nit == 8 || nit == 16) && LR % 2 == 0;

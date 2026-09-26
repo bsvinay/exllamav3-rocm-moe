@@ -36,6 +36,7 @@ void exl3_rdna3_act_epi_set(int enable);
 #include "quant/exl3_devctx.cuh"
 #include "quant/exl3_moe.cuh"
 #include "quant/exl3_moe_coop.cuh"
+#include "quant/exl3_rdna3_moe.cuh"
 
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
@@ -183,6 +184,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
+    m.def("exl3_rdna3_moe_decode", &exl3_rdna3_moe_decode, "exl3_rdna3_moe_decode");
     m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
     m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");
     m.def("exl3_moe_cpu_forward", &exl3_moe_cpu_forward, "exl3_moe_cpu_forward",

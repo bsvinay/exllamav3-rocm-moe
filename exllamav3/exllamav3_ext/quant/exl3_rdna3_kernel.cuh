@@ -314,6 +314,7 @@ __device__ __forceinline__ void exl3_rdna3_unit
     {
         const int src = mt.src ? mt.src[e] : e;
         B = (const uint32_t*) mt.b[e];
+        if (!B) return;   // entry not resident on this device (MoE decode): whole block exits
         svh = (const half*) mt.svh[e];
         if (mt.c) C = (void*) mt.c[e];
         else C = (void*) ((char*) C + (size_t) e * size_m * size_n * (c_fp32 ? 4 : 2));

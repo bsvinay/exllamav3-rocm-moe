@@ -8,6 +8,7 @@
 #include "../graph.cuh"
 #include "exl3_devctx.cuh"
 #include "exl3_rdna3.cuh"
+#include "exl3_rdna3_moe.cuh"
 
 namespace
 {
@@ -354,6 +355,249 @@ bool exl3_rdna3_mgemm
             graph->record_param((void*) kernel, GP_mgemm_C, 2);
             graph->record_param((void*) kernel, GP_end, 0);
         }
+        cuda_check(cudaPeekAtLastError());
+        return true;
+    #else
+        return false;
+    #endif
+}
+
+// -------------------------------------------------------------------------------------------------
+// Routed MoE experts for decode-sized batches (exl3_rdna3_moe_decode). Every (token, top-k slot) pair
+// is one matmul entry with its own transformed input (the expert's suh differs), so a token batch
+// needs no host-side grouping and no sync: prep (tables + gate/up input transforms) -> gate/up
+// matmul -> act (silu(g) * u -> down input transform) -> down matmul -> fixed-order weighted sum.
+// Pairs whose expert is not resident here (CPU split tail, other TP shard) get null trellis
+// pointers; the matmul kernel skips such entries
+// -------------------------------------------------------------------------------------------------
+
+#include "exl3_rdna3_had.cuh"
+#include "bits_k.cuh"
+
+#ifdef __HIP_PLATFORM_AMD__
+namespace {
+
+__global__ __launch_bounds__(256)
+void moe_prep_kernel
+(
+    const half* __restrict__ y,
+    const int64_t* __restrict__ sel,
+    int topk,
+    int num_local,
+    const uint64_t* __restrict__ g_tr, const uint64_t* __restrict__ g_suh, const uint64_t* __restrict__ g_svh,
+    const uint64_t* __restrict__ u_tr, const uint64_t* __restrict__ u_suh, const uint64_t* __restrict__ u_svh,
+    uint64_t* __restrict__ b_tab,
+    uint64_t* __restrict__ s_tab,
+    uint2* __restrict__ xh,
+    float* __restrict__ xcs,
+    int size_k
+)
+{
+    const int p = blockIdx.y;
+    const int t = p / topk;
+    const int64_t e = sel[p];
+    const bool active = e >= 0 && e < num_local;
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        b_tab[2 * p]     = active ? g_tr[e] : 0;
+        b_tab[2 * p + 1] = active ? u_tr[e] : 0;
+        s_tab[2 * p]     = active ? g_svh[e] : 0;
+        s_tab[2 * p + 1] = active ? u_svh[e] : 0;
+    }
+    if (!active) return;
+    const int kblocks = size_k / 128;
+    const int task = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (task >= 2 * kblocks) return;
+    const int proj = task / kblocks;
+    const int c = task % kblocks;
+    const int lane = threadIdx.x & 31;
+    const half2* ap = (const half2*) (y + (size_t) t * size_k + c * 128 + lane * 4);
+    const half* suh = (const half*) (proj ? u_suh[e] : g_suh[e]);
+    const int src = 2 * p + proj;
+    exl3_rdna3_had::transform_block(ap[0], ap[1], suh, xh + (size_t) src * (size_k / 16) * 4,
+                                    xcs + (size_t) src * kblocks, 0, c, size_k, lane);
+}
+
+__global__ __launch_bounds__(256)
+void moe_act_kernel
+(
+    const half* __restrict__ c_gu,
+    const int64_t* __restrict__ sel,
+    int num_local,
+    const uint64_t* __restrict__ d_tr, const uint64_t* __restrict__ d_suh, const uint64_t* __restrict__ d_svh,
+    uint64_t* __restrict__ b_tab,
+    uint64_t* __restrict__ s_tab,
+    uint2* __restrict__ xh,
+    float* __restrict__ xcs,
+    int size_i
+)
+{
+    const int p = blockIdx.y;
+    const int64_t e = sel[p];
+    const bool active = e >= 0 && e < num_local;
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        b_tab[p] = active ? d_tr[e] : 0;
+        s_tab[p] = active ? d_svh[e] : 0;
+    }
+    if (!active) return;
+    const int kblocks = size_i / 128;
+    const int c = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (c >= kblocks) return;
+    const int lane = threadIdx.x & 31;
+    // Same half-precision rounding as the dense gate/up epilogue (and act_mul_kernel_h)
+    auto sigmoid2 = [] (half2 x) -> half2
+    {
+        const half2 one = __float2half2_rn(1.0f);
+        return h2rcp(__hadd2(one, h2exp(__hneg2(x))));
+    };
+    const size_t o = (size_t) c * 128 + lane * 4;
+    const half2* gp = (const half2*) (c_gu + (size_t) (2 * p) * size_i + o);
+    const half2* up = (const half2*) (c_gu + (size_t) (2 * p + 1) * size_i + o);
+    half2 x01 = gp[0], x23 = gp[1];
+    x01 = __hmul2(__hmul2(x01, sigmoid2(x01)), up[0]);
+    x23 = __hmul2(__hmul2(x23, sigmoid2(x23)), up[1]);
+    exl3_rdna3_had::transform_block(x01, x23, (const half*) d_suh[e], xh + (size_t) p * (size_i / 16) * 4,
+                                    xcs + (size_t) p * kblocks, 0, c, size_i, lane);
+}
+
+// out[t] = sum_j w[t, j] * down(t, j), resident pairs only, in slot order (deterministic)
+__global__ __launch_bounds__(256)
+void moe_combine_kernel
+(
+    const float* __restrict__ c_d,
+    const uint64_t* __restrict__ b_tab,
+    const half* __restrict__ w,
+    int topk,
+    int size_n,
+    float* __restrict__ out
+)
+{
+    const int t = blockIdx.y;
+    const int i = (blockIdx.x * 256 + threadIdx.x) * 4;
+    if (i >= size_n) return;
+    float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int j = 0; j < topk; ++j)
+    {
+        const int p = t * topk + j;
+        if (!b_tab[p]) continue;
+        const float wj = __half2float(w[p]);
+        const float4 v = *(const float4*) (c_d + (size_t) p * size_n + i);
+        s.x += wj * v.x; s.y += wj * v.y; s.z += wj * v.z; s.w += wj * v.w;
+    }
+    *(float4*) (out + (size_t) t * size_n + i) = s;
+}
+
+}  // namespace
+#endif
+
+bool exl3_rdna3_moe_decode
+(
+    const at::Tensor& y,        // (T, H) half, routed input
+    const at::Tensor& sel,      // (T, topk) int64, local expert index (outside [0, num_local): not here)
+    const at::Tensor& w,        // (T, topk) half, routing weights
+    const at::Tensor& g_tr, const at::Tensor& g_suh, const at::Tensor& g_svh,   // (E) int64 pointer tables
+    const at::Tensor& u_tr, const at::Tensor& u_suh, const at::Tensor& u_svh,
+    const at::Tensor& d_tr, const at::Tensor& d_suh, const at::Tensor& d_svh,
+    double K_gu,
+    double K_d,
+    bool mcg,
+    bool mul1,
+    int64_t num_local,
+    at::Tensor& tabs,           // int64 scratch, >= 6 * T * topk
+    at::Tensor& c_gu,           // (>= 2 * T * topk, I) half scratch
+    at::Tensor& c_d,            // (>= T * topk, H) float scratch
+    at::Tensor& out             // (T, H) float, overwritten
+)
+{
+    #ifdef __HIP_PLATFORM_AMD__
+        if (!exl3_rdna3_enabled()) return false;
+        const at::cuda::OptionalCUDAGuard device_guard(y.device());
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+        int device;
+        cudaGetDevice(&device);
+
+        TORCH_CHECK_DTYPE(y, kHalf);
+        TORCH_CHECK_DTYPE(sel, kLong);
+        TORCH_CHECK_DTYPE(w, kHalf);
+        TORCH_CHECK_DTYPE(tabs, kLong);
+        TORCH_CHECK_DTYPE(c_gu, kHalf);
+        TORCH_CHECK_DTYPE(c_d, kFloat);
+        TORCH_CHECK_DTYPE(out, kFloat);
+        TORCH_CHECK(y.is_contiguous() && sel.is_contiguous() && w.is_contiguous() && out.is_contiguous(),
+                    "exl3_rdna3_moe_decode: contiguous inputs required");
+        const int T = y.size(0);
+        const int H = y.size(1);
+        const int topk = sel.size(1);
+        const int P = T * topk;
+        const int I = c_gu.size(1);
+        if (H % 128 || I % 128) return false;
+        TORCH_CHECK(tabs.numel() >= 6 * P && c_gu.size(0) >= 2 * P && c_d.size(0) >= P && c_d.size(1) == H,
+                    "exl3_rdna3_moe_decode: scratch too small");
+        if ((size_t) 2 * P * H * 2 > EXL3_RDNA3_XH_BYTES || (size_t) 2 * P * (H / 128) > EXL3_RDNA3_XCS_FLOATS) return false;
+        if ((size_t) P * I * 2 > XH2_BYTES || (size_t) P * (I / 128) > XCS2_FLOATS) return false;
+
+        TORCH_CHECK(!(mcg && mul1), "exl3_rdna3_moe_decode: both mcg and mul1");
+        const int cb = mul1 ? 2 : (mcg ? 1 : 0);
+        const BitsK bgu = bits_from_K((float) K_gu);
+        const BitsK bd = bits_from_K((float) K_d);
+        int mr;
+        fp_exl3_rdna3_kernel k_gu = select_kernel(1, bgu.bits, bgu.half, cb, false, mr);
+        fp_exl3_rdna3_kernel k_d = select_kernel(1, bd.bits, bd.half, cb, true, mr);
+        if (!k_gu || !k_d) return false;
+
+        const int groups_gu = I / 128, kb_gu = H / 128;
+        const int groups_d = H / 128, kb_d = I / 128;
+        if (groups_gu * 2 * P > EXL3_RDNA3_MAX_COUNTERS || groups_d * P > EXL3_RDNA3_MAX_COUNTERS) return false;
+
+        if (!g_ws[device]) exl3_rdna3_prepare(device);
+        g_prepared[device].A = nullptr;   // the input workspaces are overwritten here
+
+        uint64_t* tb = (uint64_t*) tabs.data_ptr();
+        uint64_t* b_gu = tb;
+        uint64_t* s_gu = tb + 2 * P;
+        uint64_t* b_d = tb + 4 * P;
+        uint64_t* s_d = tb + 5 * P;
+        auto P64 = [] (const at::Tensor& t) { return (const uint64_t*) t.data_ptr(); };
+
+        moe_prep_kernel<<<dim3((2 * kb_gu + 7) / 8, P), 256, 0, stream>>>
+        (
+            (const half*) y.data_ptr(), (const int64_t*) sel.data_ptr(), topk, (int) num_local,
+            P64(g_tr), P64(g_suh), P64(g_svh), P64(u_tr), P64(u_suh), P64(u_svh),
+            b_gu, s_gu, g_xh[device], g_xcs[device], H
+        );
+
+        int splits, ks;
+        choose_splits(groups_gu * 2 * P, kb_gu, (size_t) 2 * P * I * sizeof(float), device, splits, ks);
+        Exl3Rdna3MTab mt_gu {};
+        mt_gu.b = b_gu;
+        mt_gu.svh = s_gu;
+        k_gu<<<dim3(groups_gu * splits, 1, 2 * P), EXL3_RDNA3_THREADS, 0, stream>>>
+        (
+            g_xh[device], nullptr, c_gu.data_ptr(), 1, H, I, g_counters[device], g_xcs[device], g_ws[device],
+            nullptr, splits, ks, mt_gu
+        );
+
+        moe_act_kernel<<<dim3((kb_d + 7) / 8, P), 256, 0, stream>>>
+        (
+            (const half*) c_gu.data_ptr(), (const int64_t*) sel.data_ptr(), (int) num_local,
+            P64(d_tr), P64(d_suh), P64(d_svh), b_d, s_d, g_xh2[device], g_xcs2[device], I
+        );
+
+        choose_splits(groups_d * P, kb_d, (size_t) P * H * sizeof(float), device, splits, ks);
+        Exl3Rdna3MTab mt_d {};
+        mt_d.b = b_d;
+        mt_d.svh = s_d;
+        k_d<<<dim3(groups_d * splits, 1, P), EXL3_RDNA3_THREADS, 0, stream>>>
+        (
+            g_xh2[device], nullptr, c_d.data_ptr(), 1, I, H, g_counters[device], g_xcs2[device], g_ws[device],
+            nullptr, splits, ks, mt_d
+        );
+
+        moe_combine_kernel<<<dim3((H / 4 + 255) / 256, T), 256, 0, stream>>>
+        (
+            (const float*) c_d.data_ptr(), b_d, (const half*) w.data_ptr(), topk, H, (float*) out.data_ptr()
+        );
         cuda_check(cudaPeekAtLastError());
         return true;
     #else
