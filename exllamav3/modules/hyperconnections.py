@@ -344,9 +344,10 @@ class GatedResidual(Module):
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
         self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
             .permute(0, 1, 3, 2).contiguous()
-        if self.tiled and not keep_source_weights:
+        if (self.tiled or torch.version.hip) and not keep_source_weights:
             # Every inference consumer now reads the int8 tables (tiled path) or the folded and
-            # repacked copies (fused decode path): release the fp16 sources
+            # repacked copies (fused decode path; on ROCm also the prefill GEMM path, see _mix):
+            # release the fp16 sources
             self.proj_h = self.down_h = self.inject_h = self.up_h = None
 
     @override
@@ -442,6 +443,22 @@ class GatedResidual(Module):
                 ws((S, Rpad, Mpad), torch.float), ws((S, Rpad), torch.float), ws((R, H), torch.float),
                 ws((2, R, self.rank), torch.int8), ws((R, self.rank // 64), torch.float), post, mixed
             )
+        elif self.proj_h is None:
+            # GEMM path from the folded tables (sources released): fn_h = proj * w, so the
+            # projection takes the unweighted norm, and the (H * D, rank) up matrix is a
+            # transposed view of the repacked upx_h (copied per call; prefill-sized R only)
+            post = torch.empty((R, H), dtype = torch.float, device = dev) \
+                if self.use_combine else None
+            normed = torch.empty((R * H, Dh), dtype = torch.half, device = dev)
+            ext.rms_norm(s3.view(R * H, Dh), None, normed, self.rms_eps, 0.0, 1.0, False, False, H)
+            dm = torch.matmul(normed.view(R, H * Dh), self.fn_h.t())                 # (R, rank [+ H])
+            t = F.silu(dm[:, : self.rank] / H)
+            if self.use_combine:
+                post.copy_(2.0 * torch.sigmoid(dm[:, self.rank :].float() / H))
+            up = self.upx_h.permute(0, 1, 3, 2).reshape(H * Dh, self.rank)
+            g = torch.matmul(t, up.t())                                             # (R, H * Dh)
+            mixed = (torch.sigmoid(g.float()).view(R, H, Dh)
+                     * (normed.float().view(R, H, Dh) * self.norm_w)).mean(dim = -2).half()
         else:
             self._require_source_weights("the cuBLAS path")
             post = torch.empty((R, H), dtype = torch.float, device = dev) \

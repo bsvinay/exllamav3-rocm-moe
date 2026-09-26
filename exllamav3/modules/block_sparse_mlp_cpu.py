@@ -295,6 +295,20 @@ class BlockSparseMLP_CPU:
             final_hidden_states = final_hidden_states + cpu_partial.view(shape)
         return final_hidden_states
 
+    def _split_placement_source(self):
+        """(stats file or None, dynamic placement). A stats file shipped in the model directory
+        (expert_stats.json, written by rocm_tests/moe_stats.py) selects static frequency-guided
+        placement unless swapping is requested explicitly: dynamic sweeps re-read experts from
+        the checkpoint between requests and converge slowly (a bounded number of swaps per
+        sweep). EXL3_MOE_CPU_SPLIT_STATS names a file explicitly (with EXL3_MOE_CPU_SWAP=0)."""
+        stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
+        swap_env = os.environ.get("EXL3_MOE_CPU_SWAP")
+        if stats_path is None and swap_env is None and self.config is not None:
+            auto = os.path.join(self.config.directory, "expert_stats.json")
+            if os.path.exists(auto):
+                return auto, False
+        return stats_path, (swap_env or "1") != "0"
+
     @override
     def can_defer_load(self):
         # The frequency-permuted expert split reads the router tensors right after load (to
@@ -304,7 +318,7 @@ class BlockSparseMLP_CPU:
         # cpu_maybe_split_load. Reading the env here left the guard off on the CLI path.
         if (
             int(getattr(self.config.infer_params, "moe_cpu_split", 0)) > 0 and
-            os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
+            self._split_placement_source()[0] is not None
         ):
             return False
         return super().can_defer_load()
@@ -478,9 +492,8 @@ class BlockSparseMLP_CPU:
         # both experts from the checkpoint: the promoted one into the GPU slot tensors in
         # place (all baked pointers stay valid), the demoted one into the worker's arena
         # via the install message (the child re-reads it from its own checkpoint handle)
-        self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
-            and not self.tid2eid_key
-        stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
+        stats_path, dynamic = self._split_placement_source()
+        self._split_dynamic = dynamic and not self.tid2eid_key
         if stats_path and self._split_dynamic:
             # Static placement from a stats file only applies with dynamic swapping disabled
             print(f" !! {self.key}: EXL3_MOE_CPU_SPLIT_STATS ignored, set EXL3_MOE_CPU_SWAP=0 to use it")

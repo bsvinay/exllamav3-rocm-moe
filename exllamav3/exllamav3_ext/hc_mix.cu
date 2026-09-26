@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include "hc_mix.cuh"
 #include <c10/cuda/CUDAGuard.h>
@@ -646,7 +647,8 @@ float* g_scratch[16] = {};   // per device: t (GR3_MAX_R, 1024) and rmr (GR3_MAX
 bool launch(const float* s_p, const half* fn_p, const half* up_p, const half* w_p, float* dots_p, float* post_p,
             void* mixed_p, bool hout, int R, int M, int D, int LR, float rms_eps, cudaStream_t stream)
 {
-    if (R > GR3_MAX_R || LR % 64 || LR > 1024 || D % 256) return false;
+    static const bool enabled = !(std::getenv("EXL3_GR3") && std::getenv("EXL3_GR3")[0] == '0');
+    if (!enabled || R > GR3_MAX_R || LR % 64 || LR > 1024 || D % 256) return false;
     const int nch = D / 256, nit = LR / 64;
     if (!(nch == 10 || nch == 16 || nch == 20) || !(nit == 5 || nit == 8 || nit == 16)) return false;
     int device;

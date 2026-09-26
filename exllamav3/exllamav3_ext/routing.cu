@@ -221,16 +221,43 @@ void routing_gemv_kernel
     int row = blockIdx.x * RGEMV_WARPS + warp;
     if (row >= E) return;
 
-    const half2* x2 = (const half2*) x;
-    const half2* w2 = (const half2*) (gate_t + (size_t) row * k);
-
     float sum = 0.0f;
-    for (int j = lane; j < k / 2; j += 32)
+    #ifdef __HIP_PLATFORM_AMD__
+    if (k % 8 == 0)
     {
-        float2 xf = __half22float2(x2[j]);
-        float2 wf = __half22float2(w2[j]);
-        sum = fmaf(xf.x, wf.x, sum);
-        sum = fmaf(xf.y, wf.y, sum);
+        // 16-byte loads, several in flight per lane: the 4-byte loop is latency-bound on gfx11
+        // (~29 us for a 512 x 2560 gate). Same per-lane fma chain order, x and w in 8-wide chunks
+        const int4* x8 = (const int4*) x;
+        const int4* w8 = (const int4*) (gate_t + (size_t) row * k);
+        #pragma unroll 5
+        for (int j = lane; j < k / 8; j += 32)
+        {
+            const int4 xv = x8[j];
+            const int4 wv = w8[j];
+            const half2* xh = (const half2*) &xv;
+            const half2* wh = (const half2*) &wv;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+            {
+                const float2 xf = __half22float2(xh[i]);
+                const float2 wf = __half22float2(wh[i]);
+                sum = fmaf(xf.x, wf.x, sum);
+                sum = fmaf(xf.y, wf.y, sum);
+            }
+        }
+    }
+    else
+    #endif
+    {
+        const half2* x2 = (const half2*) x;
+        const half2* w2 = (const half2*) (gate_t + (size_t) row * k);
+        for (int j = lane; j < k / 2; j += 32)
+        {
+            float2 xf = __half22float2(x2[j]);
+            float2 wf = __half22float2(w2[j]);
+            sum = fmaf(xf.x, wf.x, sum);
+            sum = fmaf(xf.y, wf.y, sum);
+        }
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)
