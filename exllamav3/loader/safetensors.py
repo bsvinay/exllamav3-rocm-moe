@@ -298,7 +298,7 @@ class DiskTensorHandle:
                 # Row gathers are small scattered preads: without the hint every page-cache miss
                 # pulls a full readahead window (128 KB+ per ~100-byte row), which turned a
                 # 65K-row prefill gather into gigabytes of I/O and evicted useful cache
-                if hasattr(os, "posix_fadvise"):
+                if hasattr(os, "posix_fadvise") and os.environ.get("EXL3_NGRAM_FADV", "1") != "0":
                     os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_RANDOM)
         return self.fd
 
