@@ -76,6 +76,8 @@ _bszn_enable = os.environ.get("EXL3_MOE_BSZN", "1") != "0"
 # layer, no host sync); EXL3_RDNA3_MOE=0 falls back to the generic paths
 _rdna3_moe_enable = bool(torch.version.hip) and os.environ.get("EXL3_RDNA3_MOE", "1") != "0"
 RDNA3_MOE_MAX_TOKENS = 16
+# EXL3_RDNA3_MOE_SHARED=0 keeps the shared expert on its own GatedMLP path
+_rdna3_moe_shared = os.environ.get("EXL3_RDNA3_MOE_SHARED", "1") != "0"
 
 # Router types whose selection runs entirely on the deterministic ext paths (routing_gemm.cu +
 # fixed-order top-k with FMA-only activations), so under tensor parallelism every rank can route
@@ -957,18 +959,42 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.multi_up.mcg == self.multi_down.mcg and self.multi_up.mul1 == self.multi_down.mul1 and
                 self.device is not None and self.device.type == "cuda"
             )
-            st = self._rdna3_moe_state = {"ok": ok}
+            st = self._rdna3_moe_state = {"ok": ok, "sh": None, "sh_gate": None, "K_sh": 0.0}
             if ok:
-                pmax = RDNA3_MOE_MAX_TOKENS * self.num_experts_per_tok
+                # Shared expert in the same pipeline (one extra pair per token): a single-slice
+                # EXL3 silu GatedMLP on the routed input, merged without a post norm
+                se = self.shared_experts
+                if (
+                    _rdna3_moe_shared and se is not None and
+                    len(getattr(se, "gates", [])) == 1 and len(se.ups) == 1 and len(se.downs) == 1 and
+                    se.activation_fn == "silu" and self.shared_experts_post_norm is None and
+                    self.latent_in is None and not self.alt_residual_channel and self.routed_pre_norm is None and
+                    all(l.quant_type == "exl3" for l in (se.gates[0], se.ups[0], se.downs[0])) and
+                    se.gates[0].inner.K == se.ups[0].inner.K == se.downs[0].inner.K and
+                    all(l.inner.mul1 == self.multi_up.mul1 and l.inner.mcg == self.multi_up.mcg
+                        for l in (se.gates[0], se.ups[0], se.downs[0])) and
+                    all(l.inner.bias is None for l in (se.gates[0], se.ups[0], se.downs[0])) and
+                    se.gates[0].in_features == self.multi_up.in_features and
+                    se.gates[0].out_features == self.multi_up.out_features and
+                    (self.shared_gate is None or self.shared_gate.inner.weight.numel() == self.hidden_size)
+                ):
+                    lins = (se.gates[0].inner, se.ups[0].inner, se.downs[0].inner)
+                    st["sh"] = torch.tensor([t.data_ptr() for l in lins for t in (l.trellis, l.suh, l.svh)],
+                                            dtype = torch.long, device = self.device)
+                    if self.shared_gate is not None:
+                        st["sh_gate"] = self.shared_gate.inner.weight.reshape(-1).half().contiguous()
+                    st["K_sh"] = float(lins[0].K)
+                pmax = RDNA3_MOE_MAX_TOKENS * (self.num_experts_per_tok + 1)
                 I = self.multi_up.out_features
                 H = self.multi_down.out_features
-                st["tabs"] = g_tensor_cache.get(self.device, (6 * pmax,), torch.long, "rdna3_moe_tabs")
+                st["tabs"] = g_tensor_cache.get(self.device, (6 * pmax + RDNA3_MOE_MAX_TOKENS,), torch.long, "rdna3_moe_tabs")
                 st["c_gu"] = g_tensor_cache.get(self.device, (2 * pmax, I), torch.half, "rdna3_moe_c_gu")
                 st["c_d"] = g_tensor_cache.get(self.device, (pmax, H), torch.float, "rdna3_moe_c_d")
                 st["out"] = g_tensor_cache.get(self.device, (RDNA3_MOE_MAX_TOKENS, H), torch.float, "rdna3_moe_out")
         return st["ok"]
 
     def _rdna3_moe_forward(self, y, bsz, selected_experts, routing_weights, eshape):
+        """Returns (routed sum incl. the shared expert when fused, shared expert fused)"""
         st = self._rdna3_moe_state
         sel = selected_experts
         if self.routing_first and self.num_local_experts != self.num_experts:
@@ -984,9 +1010,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             float(mu.K), float(md.K), bool(mu.mcg), bool(mu.mul1),
             self.num_local_experts or self.num_experts,
             st["tabs"], st["c_gu"], st["c_d"], out,
+            st["sh"], st["sh_gate"], st["K_sh"],
         )
         assert ok, "exl3_rdna3_moe_decode declined a shape it was set up for"
-        return out.view(eshape)
+        return out.view(eshape), st["sh"] is not None
 
     @override
     def unload(self):
@@ -1105,7 +1132,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # RDNA3 decode path
         elif rdna3_moe:
-            final_hidden_states = self._rdna3_moe_forward(y, bsz, selected_experts, routing_weights, eshape)
+            final_hidden_states, bc_sh_exp = self._rdna3_moe_forward(y, bsz, selected_experts, routing_weights, eshape)
 
         # Torch/C++/fused path
         elif (

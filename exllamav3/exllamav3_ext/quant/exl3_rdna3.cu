@@ -368,7 +368,9 @@ bool exl3_rdna3_mgemm
 // needs no host-side grouping and no sync: prep (tables + gate/up input transforms) -> gate/up
 // matmul -> act (silu(g) * u -> down input transform) -> down matmul -> fixed-order weighted sum.
 // Pairs whose expert is not resident here (CPU split tail, other TP shard) get null trellis
-// pointers; the matmul kernel skips such entries
+// pointers; the matmul kernel skips such entries. An optional shared expert (with an optional
+// sigmoid gate on the input) rides along as one extra pair per token: its own gate/up and down
+// launches (it may have another bitrate), its gate dot in the prep kernel, its sum in the combine
 // -------------------------------------------------------------------------------------------------
 
 #include "exl3_rdna3_had.cuh"
@@ -377,15 +379,22 @@ bool exl3_rdna3_mgemm
 #ifdef __HIP_PLATFORM_AMD__
 namespace {
 
+// Shared expert pointer table layout (int64): g tr/suh/svh, u tr/suh/svh, d tr/suh/svh
+enum { SH_GT, SH_GSUH, SH_GSVH, SH_UT, SH_USUH, SH_USVH, SH_DT, SH_DSUH, SH_DSVH, SH_N };
+
 __global__ __launch_bounds__(256)
 void moe_prep_kernel
 (
     const half* __restrict__ y,
     const int64_t* __restrict__ sel,
     int topk,
+    int P,                          // routed pairs; rows P .. P + T - 1 of the grid are shared-expert rows
     int num_local,
     const uint64_t* __restrict__ g_tr, const uint64_t* __restrict__ g_suh, const uint64_t* __restrict__ g_svh,
     const uint64_t* __restrict__ u_tr, const uint64_t* __restrict__ u_suh, const uint64_t* __restrict__ u_svh,
+    const uint64_t* __restrict__ sh,        // shared expert table or null
+    const half* __restrict__ sh_gate,       // (size_k) shared-expert input gate, or null
+    float* __restrict__ gate_out,           // (T) sigmoid(y . sh_gate)
     uint64_t* __restrict__ b_tab,
     uint64_t* __restrict__ s_tab,
     uint2* __restrict__ xh,
@@ -394,15 +403,47 @@ void moe_prep_kernel
 )
 {
     const int p = blockIdx.y;
-    const int t = p / topk;
-    const int64_t e = sel[p];
-    const bool active = e >= 0 && e < num_local;
+    const bool shared = p >= P;
+    const int t = shared ? p - P : p / topk;
+    int64_t e = 0;
+    bool active = true;
+    const uint64_t *gt = g_tr, *gs = g_suh, *gv = g_svh, *ut = u_tr, *us = u_suh, *uv = u_svh;
+    if (shared)
+    {
+        gt = sh + SH_GT; gs = sh + SH_GSUH; gv = sh + SH_GSVH;
+        ut = sh + SH_UT; us = sh + SH_USUH; uv = sh + SH_USVH;
+        if (blockIdx.x == 0)
+        {
+            // gate = sigmoid(y[t] . w), whole block
+            __shared__ float red[8];
+            float a = 0.0f;
+            if (sh_gate)
+                for (int i = threadIdx.x; i < size_k; i += 256)
+                    a = fmaf(__half2float(y[(size_t) t * size_k + i]), __half2float(sh_gate[i]), a);
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) a += __shfl_xor(a, o);
+            if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = a;
+            __syncthreads();
+            if (threadIdx.x == 0)
+            {
+                float v = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < 8; ++w) v += red[w];
+                gate_out[t] = sh_gate ? 1.0f / (1.0f + __expf(-v)) : 1.0f;
+            }
+        }
+    }
+    else
+    {
+        e = sel[p];
+        active = e >= 0 && e < num_local;
+    }
     if (blockIdx.x == 0 && threadIdx.x == 0)
     {
-        b_tab[2 * p]     = active ? g_tr[e] : 0;
-        b_tab[2 * p + 1] = active ? u_tr[e] : 0;
-        s_tab[2 * p]     = active ? g_svh[e] : 0;
-        s_tab[2 * p + 1] = active ? u_svh[e] : 0;
+        b_tab[2 * p]     = active ? gt[e] : 0;
+        b_tab[2 * p + 1] = active ? ut[e] : 0;
+        s_tab[2 * p]     = active ? gv[e] : 0;
+        s_tab[2 * p + 1] = active ? uv[e] : 0;
     }
     if (!active) return;
     const int kblocks = size_k / 128;
@@ -412,7 +453,7 @@ void moe_prep_kernel
     const int c = task % kblocks;
     const int lane = threadIdx.x & 31;
     const half2* ap = (const half2*) (y + (size_t) t * size_k + c * 128 + lane * 4);
-    const half* suh = (const half*) (proj ? u_suh[e] : g_suh[e]);
+    const half* suh = (const half*) (proj ? us[e] : gs[e]);
     const int src = 2 * p + proj;
     exl3_rdna3_had::transform_block(ap[0], ap[1], suh, xh + (size_t) src * (size_k / 16) * 4,
                                     xcs + (size_t) src * kblocks, 0, c, size_k, lane);
@@ -423,8 +464,10 @@ void moe_act_kernel
 (
     const half* __restrict__ c_gu,
     const int64_t* __restrict__ sel,
+    int P,
     int num_local,
     const uint64_t* __restrict__ d_tr, const uint64_t* __restrict__ d_suh, const uint64_t* __restrict__ d_svh,
+    const uint64_t* __restrict__ sh,
     uint64_t* __restrict__ b_tab,
     uint64_t* __restrict__ s_tab,
     uint2* __restrict__ xh,
@@ -433,12 +476,20 @@ void moe_act_kernel
 )
 {
     const int p = blockIdx.y;
-    const int64_t e = sel[p];
-    const bool active = e >= 0 && e < num_local;
+    const bool shared = p >= P;
+    int64_t e = 0;
+    bool active = true;
+    const uint64_t *dt = d_tr, *ds = d_suh, *dv = d_svh;
+    if (shared) { dt = sh + SH_DT; ds = sh + SH_DSUH; dv = sh + SH_DSVH; }
+    else
+    {
+        e = sel[p];
+        active = e >= 0 && e < num_local;
+    }
     if (blockIdx.x == 0 && threadIdx.x == 0)
     {
-        b_tab[p] = active ? d_tr[e] : 0;
-        s_tab[p] = active ? d_svh[e] : 0;
+        b_tab[p] = active ? dt[e] : 0;
+        s_tab[p] = active ? dv[e] : 0;
     }
     if (!active) return;
     const int kblocks = size_i / 128;
@@ -457,18 +508,20 @@ void moe_act_kernel
     half2 x01 = gp[0], x23 = gp[1];
     x01 = __hmul2(__hmul2(x01, sigmoid2(x01)), up[0]);
     x23 = __hmul2(__hmul2(x23, sigmoid2(x23)), up[1]);
-    exl3_rdna3_had::transform_block(x01, x23, (const half*) d_suh[e], xh + (size_t) p * (size_i / 16) * 4,
+    exl3_rdna3_had::transform_block(x01, x23, (const half*) ds[e], xh + (size_t) p * (size_i / 16) * 4,
                                     xcs + (size_t) p * kblocks, 0, c, size_i, lane);
 }
 
-// out[t] = sum_j w[t, j] * down(t, j), resident pairs only, in slot order (deterministic)
+// out[t] = sum_j w[t, j] * down(t, j) over resident pairs in slot order, + gate[t] * shared(t)
 __global__ __launch_bounds__(256)
 void moe_combine_kernel
 (
     const float* __restrict__ c_d,
     const uint64_t* __restrict__ b_tab,
     const half* __restrict__ w,
+    const float* __restrict__ gate,     // (T) or null: no shared expert
     int topk,
+    int P,
     int size_n,
     float* __restrict__ out
 )
@@ -484,6 +537,12 @@ void moe_combine_kernel
         const float wj = __half2float(w[p]);
         const float4 v = *(const float4*) (c_d + (size_t) p * size_n + i);
         s.x += wj * v.x; s.y += wj * v.y; s.z += wj * v.z; s.w += wj * v.w;
+    }
+    if (gate)
+    {
+        const float g = gate[t];
+        const float4 v = *(const float4*) (c_d + (size_t) (P + t) * size_n + i);
+        s.x += g * v.x; s.y += g * v.y; s.z += g * v.z; s.w += g * v.w;
     }
     *(float4*) (out + (size_t) t * size_n + i) = s;
 }
@@ -504,10 +563,13 @@ bool exl3_rdna3_moe_decode
     bool mcg,
     bool mul1,
     int64_t num_local,
-    at::Tensor& tabs,           // int64 scratch, >= 6 * T * topk
-    at::Tensor& c_gu,           // (>= 2 * T * topk, I) half scratch
-    at::Tensor& c_d,            // (>= T * topk, H) float scratch
-    at::Tensor& out             // (T, H) float, overwritten
+    at::Tensor& tabs,           // int64 scratch, >= 6 * (T * topk + T) + T
+    at::Tensor& c_gu,           // (>= 2 * (T * topk + T), I) half scratch
+    at::Tensor& c_d,            // (>= T * topk + T, H) float scratch
+    at::Tensor& out,            // (T, H) float, overwritten
+    const c10::optional<at::Tensor>& sh_tab,    // (9) int64 shared expert pointers (SH_* order)
+    const c10::optional<at::Tensor>& sh_gate,   // (H) half shared expert input gate
+    double K_sh
 )
 {
     #ifdef __HIP_PLATFORM_AMD__
@@ -526,16 +588,25 @@ bool exl3_rdna3_moe_decode
         TORCH_CHECK_DTYPE(out, kFloat);
         TORCH_CHECK(y.is_contiguous() && sel.is_contiguous() && w.is_contiguous() && out.is_contiguous(),
                     "exl3_rdna3_moe_decode: contiguous inputs required");
+        const bool shared = sh_tab.has_value();
         const int T = y.size(0);
         const int H = y.size(1);
         const int topk = sel.size(1);
         const int P = T * topk;
+        const int Ts = shared ? T : 0;
+        const int PS = P + Ts;
         const int I = c_gu.size(1);
         if (H % 128 || I % 128) return false;
-        TORCH_CHECK(tabs.numel() >= 6 * P && c_gu.size(0) >= 2 * P && c_d.size(0) >= P && c_d.size(1) == H,
+        TORCH_CHECK(tabs.numel() >= 6 * PS + Ts && c_gu.size(0) >= 2 * PS && c_d.size(0) >= PS && c_d.size(1) == H,
                     "exl3_rdna3_moe_decode: scratch too small");
-        if ((size_t) 2 * P * H * 2 > EXL3_RDNA3_XH_BYTES || (size_t) 2 * P * (H / 128) > EXL3_RDNA3_XCS_FLOATS) return false;
-        if ((size_t) P * I * 2 > XH2_BYTES || (size_t) P * (I / 128) > XCS2_FLOATS) return false;
+        if ((size_t) 2 * PS * H * 2 > EXL3_RDNA3_XH_BYTES || (size_t) 2 * PS * (H / 128) > EXL3_RDNA3_XCS_FLOATS) return false;
+        if ((size_t) PS * I * 2 > XH2_BYTES || (size_t) PS * (I / 128) > XCS2_FLOATS) return false;
+        if (shared)
+        {
+            TORCH_CHECK_DTYPE(sh_tab.value(), kLong);
+            TORCH_CHECK(sh_tab.value().numel() >= 9, "exl3_rdna3_moe_decode: shared table");
+            if (sh_gate.has_value()) { TORCH_CHECK_DTYPE(sh_gate.value(), kHalf); TORCH_CHECK(sh_gate.value().numel() == H, "shared gate"); }
+        }
 
         TORCH_CHECK(!(mcg && mul1), "exl3_rdna3_moe_decode: both mcg and mul1");
         const int cb = mul1 ? 2 : (mcg ? 1 : 0);
@@ -544,6 +615,14 @@ bool exl3_rdna3_moe_decode
         int mr;
         fp_exl3_rdna3_kernel k_gu = select_kernel(1, bgu.bits, bgu.half, cb, false, mr);
         fp_exl3_rdna3_kernel k_d = select_kernel(1, bd.bits, bd.half, cb, true, mr);
+        fp_exl3_rdna3_kernel k_sgu = nullptr, k_sd = nullptr;
+        if (shared)
+        {
+            const BitsK bs = bits_from_K((float) K_sh);
+            k_sgu = select_kernel(1, bs.bits, bs.half, cb, false, mr);
+            k_sd = select_kernel(1, bs.bits, bs.half, cb, true, mr);
+            if (!k_sgu || !k_sd) return false;
+        }
         if (!k_gu || !k_d) return false;
 
         const int groups_gu = I / 128, kb_gu = H / 128;
@@ -555,48 +634,61 @@ bool exl3_rdna3_moe_decode
 
         uint64_t* tb = (uint64_t*) tabs.data_ptr();
         uint64_t* b_gu = tb;
-        uint64_t* s_gu = tb + 2 * P;
-        uint64_t* b_d = tb + 4 * P;
-        uint64_t* s_d = tb + 5 * P;
+        uint64_t* s_gu = tb + 2 * PS;
+        uint64_t* b_d = tb + 4 * PS;
+        uint64_t* s_d = tb + 5 * PS;
+        float* gate = shared ? (float*) (tb + 6 * PS) : nullptr;
         auto P64 = [] (const at::Tensor& t) { return (const uint64_t*) t.data_ptr(); };
+        const uint64_t* sh = shared ? P64(sh_tab.value()) : nullptr;
+        const half* shg = shared && sh_gate.has_value() ? (const half*) sh_gate.value().data_ptr() : nullptr;
+        uint2* xh = g_xh[device];
+        float* xcs = g_xcs[device];
+        uint2* xh2 = g_xh2[device];
+        float* xcs2 = g_xcs2[device];
+        half* cgu = (half*) c_gu.data_ptr();
+        float* cd = (float*) c_d.data_ptr();
 
-        moe_prep_kernel<<<dim3((2 * kb_gu + 7) / 8, P), 256, 0, stream>>>
+        moe_prep_kernel<<<dim3((2 * kb_gu + 7) / 8, PS), 256, 0, stream>>>
         (
-            (const half*) y.data_ptr(), (const int64_t*) sel.data_ptr(), topk, (int) num_local,
+            (const half*) y.data_ptr(), (const int64_t*) sel.data_ptr(), topk, P, (int) num_local,
             P64(g_tr), P64(g_suh), P64(g_svh), P64(u_tr), P64(u_suh), P64(u_svh),
-            b_gu, s_gu, g_xh[device], g_xcs[device], H
+            sh, shg, gate, b_gu, s_gu, xh, xcs, H
         );
 
-        int splits, ks;
-        choose_splits(groups_gu * 2 * P, kb_gu, (size_t) 2 * P * I * sizeof(float), device, splits, ks);
-        Exl3Rdna3MTab mt_gu {};
-        mt_gu.b = b_gu;
-        mt_gu.svh = s_gu;
-        k_gu<<<dim3(groups_gu * splits, 1, 2 * P), EXL3_RDNA3_THREADS, 0, stream>>>
+        auto launch = [&] (fp_exl3_rdna3_kernel k, int entries, int groups, int kblocks, int size_k, int size_n,
+                           const uint64_t* b, const uint64_t* s, uint2* x, float* xs, void* C, bool fp32)
+        {
+            int splits, ks;
+            choose_splits(groups * entries, kblocks, (size_t) entries * size_n * sizeof(float), device, splits, ks);
+            Exl3Rdna3MTab mt {};
+            mt.b = b;
+            mt.svh = s;
+            k<<<dim3(groups * splits, 1, entries), EXL3_RDNA3_THREADS, 0, stream>>>
+            (
+                x, nullptr, C, 1, size_k, size_n, g_counters[device], xs, g_ws[device], nullptr, splits, ks, mt
+            );
+            (void) fp32;
+        };
+
+        launch(k_gu, 2 * P, groups_gu, kb_gu, H, I, b_gu, s_gu, xh, xcs, cgu, false);
+        if (shared)
+            launch(k_sgu, 2 * Ts, groups_gu, kb_gu, H, I, b_gu + 2 * P, s_gu + 2 * P,
+                   xh + (size_t) 2 * P * (H / 16) * 4, xcs + (size_t) 2 * P * kb_gu, cgu + (size_t) 2 * P * I, false);
+
+        moe_act_kernel<<<dim3((kb_d + 7) / 8, PS), 256, 0, stream>>>
         (
-            g_xh[device], nullptr, c_gu.data_ptr(), 1, H, I, g_counters[device], g_xcs[device], g_ws[device],
-            nullptr, splits, ks, mt_gu
+            cgu, (const int64_t*) sel.data_ptr(), P, (int) num_local,
+            P64(d_tr), P64(d_suh), P64(d_svh), sh, b_d, s_d, xh2, xcs2, I
         );
 
-        moe_act_kernel<<<dim3((kb_d + 7) / 8, P), 256, 0, stream>>>
-        (
-            (const half*) c_gu.data_ptr(), (const int64_t*) sel.data_ptr(), (int) num_local,
-            P64(d_tr), P64(d_suh), P64(d_svh), b_d, s_d, g_xh2[device], g_xcs2[device], I
-        );
-
-        choose_splits(groups_d * P, kb_d, (size_t) P * H * sizeof(float), device, splits, ks);
-        Exl3Rdna3MTab mt_d {};
-        mt_d.b = b_d;
-        mt_d.svh = s_d;
-        k_d<<<dim3(groups_d * splits, 1, P), EXL3_RDNA3_THREADS, 0, stream>>>
-        (
-            g_xh2[device], nullptr, c_d.data_ptr(), 1, I, H, g_counters[device], g_xcs2[device], g_ws[device],
-            nullptr, splits, ks, mt_d
-        );
+        launch(k_d, P, groups_d, kb_d, I, H, b_d, s_d, xh2, xcs2, cd, true);
+        if (shared)
+            launch(k_sd, Ts, groups_d, kb_d, I, H, b_d + P, s_d + P,
+                   xh2 + (size_t) P * (I / 16) * 4, xcs2 + (size_t) P * kb_d, cd + (size_t) P * H, true);
 
         moe_combine_kernel<<<dim3((H / 4 + 255) / 256, T), 256, 0, stream>>>
         (
-            (const float*) c_d.data_ptr(), b_d, (const half*) w.data_ptr(), topk, H, (float*) out.data_ptr()
+            cd, b_d, (const half*) w.data_ptr(), gate, topk, P, H, (float*) out.data_ptr()
         );
         cuda_check(cudaPeekAtLastError());
         return true;

@@ -75,16 +75,23 @@ def run_pending_swap_sweeps(infer_params):
         for h in {m.cpu_host for m in reg}:
             assert int(h.v_jobs_head[0]) == int(h.v_jobs_tail[0]), \
                 "swap sweep: job ring not drained after all-device sync"
-    budget = int(os.environ.get("EXL3_MOE_CPU_SWAP_MAX", 64))
+    # Budget per sweep, spread evenly over the layers (first-come let the early layers take it all)
+    import time
+    t0 = time.perf_counter()
+    budget = int(os.environ.get("EXL3_MOE_CPU_SWAP_MAX", 384))
+    per_layer = max(1, -(-budget // len(reg)))
     total = 0
     for m in reg:
-        if budget <= 0:
-            break
-        n = m._split_sweep_layer(budget)
-        budget -= n
-        total += n
+        total += m._split_sweep_layer(per_layer)
     if total and os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG"):
-        print(f" -- expert swap sweep: {total} swaps", flush = True)
+        print(f" -- expert swap sweep: {total} swaps in {time.perf_counter() - t0:.2f} s", flush = True)
+
+
+def _moe_arena_swizzle():
+    """Whether the worker stores trellis tensors band-swizzled (mirrors the child's choice)"""
+    from ..model.moe_cpu_host import TUNING
+    from ..ext import exllamav3_ext as ext
+    return TUNING.swizzle and ext.exl3_moe_cpu_has_avx512_bw()
 
 
 class BlockSparseMLP_CPU:
@@ -296,17 +303,18 @@ class BlockSparseMLP_CPU:
         return final_hidden_states
 
     def _split_placement_source(self):
-        """(stats file or None, dynamic placement). A stats file shipped in the model directory
-        (expert_stats.json, written by rocm_tests/moe_stats.py) selects static frequency-guided
-        placement unless swapping is requested explicitly: dynamic sweeps re-read experts from
-        the checkpoint between requests and converge slowly (a bounded number of swaps per
-        sweep). EXL3_MOE_CPU_SPLIT_STATS names a file explicitly (with EXL3_MOE_CPU_SWAP=0)."""
+        """(stats file or None, dynamic placement). A stats file (expert_stats.json in the model
+        directory, written by rocm_tests/moe_stats.py, or EXL3_MOE_CPU_SPLIT_STATS) seeds the
+        placement hot-to-cold; dynamic swapping (default on, EXL3_MOE_CPU_SWAP=0 disables) then
+        adapts it to the workload between requests. Measured on 2000-token generations: static
+        general-purpose stats leave 38-52% of decode picks on the CPU at 166 GPU slots, placement
+        adapted to the first half of the same task 16-24% on the second half."""
         stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
         swap_env = os.environ.get("EXL3_MOE_CPU_SWAP")
-        if stats_path is None and swap_env is None and self.config is not None:
+        if stats_path is None and self.config is not None:
             auto = os.path.join(self.config.directory, "expert_stats.json")
             if os.path.exists(auto):
-                return auto, False
+                stats_path = auto
         return stats_path, (swap_env or "1") != "0"
 
     @override
@@ -494,10 +502,6 @@ class BlockSparseMLP_CPU:
         # via the install message (the child re-reads it from its own checkpoint handle)
         stats_path, dynamic = self._split_placement_source()
         self._split_dynamic = dynamic and not self.tid2eid_key
-        if stats_path and self._split_dynamic:
-            # Static placement from a stats file only applies with dynamic swapping disabled
-            print(f" !! {self.key}: EXL3_MOE_CPU_SPLIT_STATS ignored, set EXL3_MOE_CPU_SWAP=0 to use it")
-            stats_path = None
         if stats_path and self.tid2eid_key:
             print(f" !! {self.key}: tid2eid remap present, tail placement unpermuted")
             stats_path = None
@@ -567,6 +571,9 @@ class BlockSparseMLP_CPU:
         # Shrink to the GPU slice. The tail Linears leave the module tree entirely (never
         # loaded); unload() restores them so a reload can redo the split cleanly
         tail = set((self.gates[first:] if self.gated else []) + self.ups[first:] + self.downs[first:])
+        # Full expert lists in router order (permuted when a stats file seeded the placement):
+        # the swap sweep reads promoted / demoted experts through these
+        self._split_full = (self.gates, self.ups, self.downs)
         self._split_saved = (*self._split_saved_lists, self.modules,
                             self.num_local_experts, self.routing_first, self.routing_last)
         del self._split_saved_lists
@@ -621,7 +628,8 @@ class BlockSparseMLP_CPU:
         pairs (per-expert quant width differences). Decays the counts afterwards so the
         stats track recent routing."""
         first = self.cpu_split_first
-        hyst = float(os.environ.get("EXL3_MOE_CPU_SWAP_HYST", 2.0))
+        fast = getattr(self.cpu_host, "pinned", False)
+        hyst = float(os.environ.get("EXL3_MOE_CPU_SWAP_HYST", 1.25 if fast else 2.0))
         mp = self._split_map.cpu()
         hist = self._split_hist.cpu()
         # Absolute mass floor on top of the ratio test: with short accumulation windows the
@@ -630,7 +638,7 @@ class BlockSparseMLP_CPU:
         # a checkpoint read). Requiring several multiples of the uniform expectation makes
         # the settled state a fixed point: post-settling tail experts sit far below the
         # floor, so sweeps become no-ops
-        floor = float(os.environ.get("EXL3_MOE_CPU_SWAP_FLOOR", 8.0)) \
+        floor = float(os.environ.get("EXL3_MOE_CPU_SWAP_FLOOR", 2.0 if fast else 8.0)) \
             * float(hist.sum()) / self.num_experts
         head = [(float(hist[r]), r) for r in range(self.num_experts) if int(mp[r]) < first]
         tail = [(float(hist[r]), r) for r in range(self.num_experts) if int(mp[r]) >= first]
@@ -642,6 +650,7 @@ class BlockSparseMLP_CPU:
                 break
             if self._split_swap_experts(r_cold, r_hot, mp):
                 nswaps += 1
+        self._split_sweep_flush()
         if nswaps:
             if os.environ.get("EXL3_MOE_CPU_SWAP_VERIFY"):
                 assert mp.sort().values.equal(torch.arange(self.num_experts)), \
@@ -650,10 +659,105 @@ class BlockSparseMLP_CPU:
         self._split_hist.mul_(0.5)
         return nswaps
 
+    def _split_swap_experts_arena(self, r_cold, r_hot, mp):
+        """Pinned-arena swap without checkpoint reads: the hot expert's trellis block is DMA'd
+        out of the worker's shared arena (band-swizzled for the AVX-512 kernels) and unswizzled
+        into the cold expert's GPU slot, whose own trellis goes the other way into the same arena
+        block; suh / svh come from the device-side aux copies of the streamed-prefill path.
+        Returns None when the fast path does not apply (caller falls back to checkpoint reads)."""
+        host = self.cpu_host
+        li = self.cpu_layer_idx
+        if not host.pinned or li >= len(host.layer_blocks) or host.layer_blocks[li] is None:
+            return None
+        aux = host.aux.get(li)
+        if not aux or any(aux.get(n) is None for n in ("suh_u", "svh_u", "suh_d", "svh_d")):
+            return None
+        if any(getattr(l.inner, "bias", None) is not None for l in self.ups + self.downs):
+            return None
+        first = self.cpu_split_first
+        slot = int(mp[r_cold])
+        local = int(mp[r_hot]) - first
+        names = (["g"] if self.gated else []) + ["u", "d"]
+        gpu = ([self.gates] if self.gated else []) + [self.ups, self.downs]
+        dst = [lst[slot].inner for lst in gpu]
+        spec = host.specs[li]
+        exp_b = spec["expert_bytes"]
+        if sum(d.trellis.numel() * 2 for d in dst) != exp_b:
+            return False
+        from ..ext import exllamav3_ext as ext
+        swz = _moe_arena_swizzle()
+        ci, off = host.layer_blocks[li][local]
+        arena = host.arena_views[ci][off // 2 : (off + exp_b) // 2]
+        dev = dst[0].trellis.device
+        hot = arena.to(dev)                                   # H2D from the registered arena
+        cold_blk = torch.empty(exp_b // 2, dtype = torch.int16, device = dev)
+        cold_aux = []
+        pos = 0
+        for n, d in zip(names, dst):
+            t = d.trellis
+            tk, tn, ps = t.shape
+            nel = t.numel()
+            sw = swz and ps // 16 != 8
+            cb = cold_blk[pos : pos + nel]
+            if sw:
+                cb.view(tn // 8, tk, 8, ps).copy_(t.view(tk, tn // 8, 8, ps).permute(1, 0, 2, 3))
+                t.view(tk, tn // 8, 8, ps).copy_(hot[pos : pos + nel].view(tn // 8, tk, 8, ps).permute(1, 0, 2, 3))
+            else:
+                cb.copy_(t.view(-1))
+                t.view(-1).copy_(hot[pos : pos + nel])
+            a_suh, a_svh = aux["suh_" + n][local], aux["svh_" + n][local]
+            cold_aux.append((d.suh.clone(), d.svh.clone()))
+            d.suh.copy_(a_suh)
+            d.svh.copy_(a_svh)
+            a_suh.copy_(cold_aux[-1][0])
+            a_svh.copy_(cold_aux[-1][1])
+            pos += nel
+        # D2H into the shared arena, synchronized once per layer sweep (_split_sweep_flush); the
+        # worker's private suh / svh views are updated by one batched message at the same point
+        arena.copy_(cold_blk, non_blocking = True)
+        pend = self.__dict__.setdefault("_swap_pending", [])
+        pend.append((local, [(a, b) for a, b in cold_aux], cold_blk))
+        if os.environ.get("EXL3_MOE_CPU_SWAP_VERIFY"):
+            self._split_sweep_flush()
+            # GPU slot == checkpoint of the promoted expert, arena block == (swizzled) checkpoint
+            # of the demoted one
+            stc = self.config.stc
+            full = self._split_full
+            fl = ([full[0]] if self.gated else []) + [full[1], full[2]]
+            pos = 0
+            for lst, d in zip(fl, dst):
+                k_hot, k_cold = lst[r_hot].key, lst[r_cold].key
+                for tn_, live in (("trellis", d.trellis), ("suh", d.suh), ("svh", d.svh)):
+                    fresh = stc.get_tensor(k_hot + "." + tn_, live.device, float2half = tn_ != "trellis")
+                    assert torch.equal(fresh, live), f"arena swap verify failed (GPU): {k_hot}.{tn_}"
+                ref = stc.get_tensor(k_cold + ".trellis", torch.device("cpu"))
+                tk, tn, ps = ref.shape
+                if swz and ps // 16 != 8:
+                    ref = ref.view(tk, tn // 8, 8, ps).permute(1, 0, 2, 3).contiguous()
+                nel = ref.numel()
+                assert torch.equal(ref.view(-1), arena[pos : pos + nel]), f"arena swap verify failed (arena): {k_cold}"
+                pos += nel
+        mp[r_cold], mp[r_hot] = int(mp[r_hot]), slot
+        return True
+
+    def _split_sweep_flush(self):
+        """Complete the arena swaps of this layer: wait for the D2H block copies, then hand the
+        demoted experts' suh / svh to the worker in one message"""
+        pend = self.__dict__.get("_swap_pending")
+        if not pend:
+            return
+        torch.cuda.synchronize(self.device)
+        self.cpu_host.install_expert_aux_batch(
+            self.cpu_layer_idx, [(local, [(a.cpu(), b.cpu()) for a, b in aux]) for local, aux, _ in pend])
+        self._swap_pending = []
+
     def _split_swap_experts(self, r_cold, r_hot, mp):
         """Promote router expert r_hot into the GPU slot of r_cold (checkpoint read +
         in-place tensor copy), demote r_cold by map update. mp is the host-side map, updated
         on success."""
+        fast = self._split_swap_experts_arena(r_cold, r_hot, mp)
+        if fast is not None:
+            return fast
         stc = self.config.stc
         slot = int(mp[r_cold])
         full_g, full_u, full_d = self._split_saved_lists_ref()
@@ -723,5 +827,5 @@ class BlockSparseMLP_CPU:
         return True
 
     def _split_saved_lists_ref(self):
-        g, u, d = self._split_saved[0], self._split_saved[1], self._split_saved[2]
+        g, u, d = self._split_full
         return g, u, d

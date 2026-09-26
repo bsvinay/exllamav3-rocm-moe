@@ -115,7 +115,9 @@ class MoeCpuTuning:
         # EXL3_MOE_ARENA_HUGE=2m|1g backs the memfd with hugetlbfs pages instead (requires
         # vm.nr_hugepages / hugepages-1048576kB reservations); Windows uses named sections, no
         # hugepage variant.
-        self.pinned_arena = os.environ.get("EXL3_MOE_PINNED_ARENA", "0") != "0"
+        # Default on for Linux: measured on Flash-Next (7950X3D, RX 7900 XTX) decode unchanged,
+        # streamed prefill -25%, and expert placement swaps can run out of the shared arena
+        self.pinned_arena = os.environ.get("EXL3_MOE_PINNED_ARENA", "1" if os.name == "posix" else "0") != "0"
         self.arena_huge = os.environ.get("EXL3_MOE_ARENA_HUGE", "").strip().lower()
         assert self.arena_huge in ("", "2m", "1g"), "EXL3_MOE_ARENA_HUGE must be 2m or 1g"
         if self.arena_huge and os.name == "nt":
@@ -529,6 +531,21 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
             if msg[0] == "install":
                 try:
                     install(msg[1], msg[2], msg[3])
+                    conn.send(("ok",))
+                except Exception:
+                    conn.send(("err", traceback.format_exc()))
+            elif msg[0] == "install_aux":
+                # Pinned-arena swaps: the parent already wrote the trellis blocks into the shared
+                # arena; only the per-projection suh / svh views are private to this process.
+                # msg = (tag, layer, [(local expert, [(suh, svh) per projection]), ...])
+                try:
+                    views = layer_views[msg[1]]
+                    for local, aux in msg[2]:
+                        projs = views if len(aux) == 3 else views[1:]
+                        for (suh, svh), plist in zip(aux, projs):
+                            _, v_suh, v_svh, _ = plist[local]
+                            v_suh.copy_(suh)
+                            v_svh.copy_(svh)
                     conn.send(("ok",))
                 except Exception:
                     conn.send(("err", traceback.format_exc()))
@@ -1259,6 +1276,15 @@ class MoeCpuHost:
             return ((uf + 1.0) * gf * torch.sigmoid(1.702 * gf)).half()
         uf = torch.nn.functional.relu(u.float())
         return (uf * uf).half()
+
+    def install_expert_aux_batch(self, layer_idx, entries):
+        """Pinned arena: update the suh / svh of worker experts after the parent rewrote their
+        trellis blocks in the shared arena. entries: [(local expert, [(suh, svh) CPU tensors per
+        projection, gate first when gated])]. Same quiescence requirement as install_expert."""
+        self.conn.send(("install_aux", layer_idx, entries))
+        msg = self.conn.recv()
+        if msg[0] != "ok":
+            raise RuntimeError(f"CPU MoE worker aux install failed: {msg[1] if len(msg) > 1 else msg}")
 
     def install_expert(self, layer_idx, local_idx, keys):
         """Dynamic placement: replace worker expert `local_idx` of `layer_idx` with the

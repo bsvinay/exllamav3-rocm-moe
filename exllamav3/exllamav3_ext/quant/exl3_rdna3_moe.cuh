@@ -1,9 +1,10 @@
 #pragma once
 
 #include <ATen/Tensor.h>
+#include <c10/util/Optional.h>
 
-// Routed MoE experts for decode-sized batches on RDNA3 (see exl3_rdna3.cu). Returns false when the
-// shapes are not covered (caller falls back to the generic paths)
+// Routed MoE experts (plus an optional shared expert) for decode-sized batches on RDNA3 (see
+// exl3_rdna3.cu). Returns false when the shapes are not covered (caller falls back to the generic paths)
 bool exl3_rdna3_moe_decode
 (
     const at::Tensor& y,
@@ -20,5 +21,8 @@ bool exl3_rdna3_moe_decode
     at::Tensor& tabs,
     at::Tensor& c_gu,
     at::Tensor& c_d,
-    at::Tensor& out
+    at::Tensor& out,
+    const c10::optional<at::Tensor>& sh_tab,
+    const c10::optional<at::Tensor>& sh_gate,
+    double K_sh
 );
