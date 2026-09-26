@@ -156,7 +156,9 @@ __device__ inline float block_reduce_sum_broadcast_f(float v, int num_threads)
     {
         v = lane_id < max_warp_id ? shared[lane_id] : 0.0f;
         v = warp_reduce_sum_f(v);
-        shared[0] = v;
+        // Only lane 0 holds the full sum after the shfl_down reduction: an all-lanes store is a
+        // same-address race whose winner is unspecified (on RDNA3 it is not lane 0)
+        if (lane_id == 0) shared[0] = v;
     }
     __syncthreads();
     v = shared[0];

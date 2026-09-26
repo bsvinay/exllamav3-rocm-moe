@@ -70,6 +70,8 @@ _routing_check = os.environ.get("EXL3_TP_ROUTING_CHECK", "0") != "0"
 # Shared expert as a one-expert fused decode launch (see BC_BlockSparseMLP::sh_coop); 0 keeps the
 # three-launch BC_GatedMLP graph
 _moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
+# EXL3_MOE_BSZN=0 disables the fused decode kernels (BC_BlockSparseMLP.run_bszN), for A/B tests
+_bszn_enable = os.environ.get("EXL3_MOE_BSZN", "1") != "0"
 
 # Router types whose selection runs entirely on the deterministic ext paths (routing_gemm.cu +
 # fixed-order top-k with FMA-only activations), so under tensor parallelism every rank can route
@@ -546,6 +548,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
                 self.support_quant_paths
             )
+            # exl3_moe (the fused prefill kernel) needs 90 KB of dynamic shared memory and
+            # mma.sync; gfx11 has 64 KB per workgroup, so ROCm takes the reconstruct tiers
+            if torch.version.hip:
+                self.support_fused = False
 
         # Temp buffers for graph, dq and fused-bsz1 paths
         numex = self.num_experts_per_tok
@@ -986,7 +992,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # f_threshold-1 instead of MAX_BSZN). Expert-range shards (CPU split, TP) are masked
         # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
         # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
-        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
+        bszn_eligible = _bszn_enable and self.bc is not None and bsz <= MAX_BSZN
 
         # Routing
         if self.router_pre_norm:
@@ -1050,7 +1056,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Torch/C++/fused path
         elif (
-            (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
+            (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or not _bszn_enable or
             self.config.infer_params.no_reconstruct or
             not (self.support_quant_paths or bszn_eligible)
         ):

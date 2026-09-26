@@ -243,6 +243,12 @@ static RGWorkspace g_rg_ws[32];
 
 bool routing_gemm_det_fits(const at::Tensor& hidden, const at::Tensor& gate_i8, const at::Tensor& gate_sb, const at::Tensor& scores)
 {
+    #if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+    // 97 KB dynamic LDS ring + 512-thread blocks exceed gfx11 (64 KB per workgroup), and the
+    // kernel relies on cp.async / mma.sync. Deterministic routing only matters for TP, so ROCm
+    // takes the GEMV (bsz 1) and hgemm paths
+    return false;
+    #endif
     if (hidden.dtype() != at::kHalf || gate_i8.dtype() != at::kChar || gate_sb.dtype() != at::kFloat || scores.dtype() != at::kHalf) return false;
     if (!hidden.is_contiguous() || !gate_i8.is_contiguous() || !gate_sb.is_contiguous() || !scores.is_contiguous()) return false;
     const int K = hidden.size(-1);

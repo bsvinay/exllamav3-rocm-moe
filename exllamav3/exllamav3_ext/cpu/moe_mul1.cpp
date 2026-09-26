@@ -2023,8 +2023,10 @@ void forward_phase(void* vctx, int worker, int num_workers)
                 // ships swiglu_limit = 10 with plain silu: hidden states deep into a long
                 // context push |u| into the thousands, and skipping the clamp here made
                 // offloaded experts diverge arbitrarily far from their GPU-resident twins
+                // No limit is FLT_MAX, not infinity: -Ofast implies -ffinite-math-only, under which
+                // clang folds min/clamp against an infinite bound to zero (all-zero expert output)
                 const float lim = L.act_limit != 0.0f
-                    ? L.act_limit : std::numeric_limits<float>::infinity();
+                    ? L.act_limit : std::numeric_limits<float>::max();
                 switch (L.activation) {
                     case 0:
                         for (size_t i = 0; i < count; ++i) {

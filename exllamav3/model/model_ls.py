@@ -258,6 +258,8 @@ class Model_LSMixin(ABC):
                             "CUDA out of memory" in str(e) or \
                             "HIP out of memory" in str(e):
                             # Exception object will hold references to tensors so we can't free them here
+                            if os.environ.get("EXL3_AUTOSPLIT_DEBUG"):
+                                print(f" !! autosplit OOM at {getattr(module, 'key', module)}: {str(e)[:300]}", flush = True)
                             fail = True
                         else:
                             raise
@@ -277,6 +279,20 @@ class Model_LSMixin(ABC):
                         continue
 
                     # On to next module
+                    if os.environ.get("EXL3_AUTOSPLIT_DEBUG"):
+                        print(f" -- loaded {getattr(module, 'key', module)}: allocated "
+                              f"{torch.cuda.memory_allocated() / 1024**3:.2f} GiB", flush = True)
+                        if str(getattr(module, 'key', '')).endswith(os.environ.get("EXL3_AUTOSPLIT_DUMP", "@none")):
+                            import gc
+                            big = {}
+                            for o in gc.get_objects():
+                                try:
+                                    if isinstance(o, torch.Tensor) and o.is_cuda and o.numel() * o.element_size() > 20 * 2**20:
+                                        big[o.untyped_storage().data_ptr()] = (o.untyped_storage().nbytes(), tuple(o.shape), o.dtype)
+                                except Exception:
+                                    pass
+                            for ptr, (nb, sh, dt) in sorted(big.items(), key = lambda kv: -kv[1][0])[:25]:
+                                print(f"    {nb / 2**20:8.1f} MiB {sh} {dt}", flush = True)
                     break
 
             if callback_sync: callback_sync(len(modules), len(modules))

@@ -97,7 +97,8 @@ class MoeCpuTuning:
         # --- GPU-streaming prefill ---
         self.stream_t_explicit = "EXL3_MOE_STREAM_T" in os.environ
         self.stream_t = int(os.environ.get("EXL3_MOE_STREAM_T", 8))
-        self.stream_fused_t = int(os.environ.get("EXL3_MOE_STREAM_FUSED_T", 256))
+        # 0 on ROCm: the fused exl3_moe kernel (90 KB LDS, mma.sync) cannot launch on gfx11
+        self.stream_fused_t = int(os.environ.get("EXL3_MOE_STREAM_FUSED_T", 0 if torch.version.hip else 256))
         self.stream_min_rows = int(os.environ.get("EXL3_MOE_STREAM_MIN_ROWS", 32))
         self.batch_experts = max(1, min(
             int(os.environ.get("EXL3_MOE_STREAM_BATCH_EXPERTS", 24)), MOE_JOB_MAX_EXPERTS))

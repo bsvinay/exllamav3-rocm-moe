@@ -430,7 +430,8 @@ void BC_BlockSparseMLP::run_single_expert
     c10::cuda::CUDAGuard device_guard(y.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    if (graph_single[graphidx].disabled || (!graph_single[graphidx].ready && !graph_single[graphidx].ready_to_record))
+    static const bool nograph = graph_disabled_for("moe");
+    if (nograph || graph_single[graphidx].disabled || (!graph_single[graphidx].ready && !graph_single[graphidx].ready_to_record))
     {
         run_single_expert_gr(y, expert_idx, nullptr);
         graph_single[graphidx].ready_to_record = true;

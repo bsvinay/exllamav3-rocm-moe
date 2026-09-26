@@ -83,6 +83,8 @@ def _worker(tier, out_path):
                     for th in ((1, threads) if tokens <= 5 else (threads,)):
                         out = torch.zeros(tokens, hid, dtype = torch.float32)
                         ext.exl3_moe_cpu_forward(h, x, sel, w, out, th)
+                        # Tiers agreeing on an all-zero output would pass the comparison below
+                        assert out.abs().sum() > 0, f"all-zero output: {tier} K{K} gated={gated} tokens={tokens}"
                         results[(K, gated, swz, tokens, th)] = out.clone()
                 ext.exl3_moe_cpu_free_layer(h)
     torch.save(results, out_path)
