@@ -1,6 +1,6 @@
 # Long code-context request through the OpenAI endpoint: TTFT and decode chunk rate
 import json, sys, time, glob, os, urllib.request
-url = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8095/v1/chat/completions"
+url = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8098/v1/chat/completions"
 target_chars = int(sys.argv[2]) if len(sys.argv) > 2 else 110000
 root = os.path.expanduser("~/exl3-moe/exllamav3/modules")
 text = ""

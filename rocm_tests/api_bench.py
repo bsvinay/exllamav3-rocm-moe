@@ -1,6 +1,6 @@
 # Streaming chat-completions benchmark against an OpenAI-compatible server (decode tok/s per prompt)
 import json, sys, time, urllib.request
-url = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8095/v1/chat/completions"
+url = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8098/v1/chat/completions"
 prompts = {
     "code": "Write a Python function that parses an ISO-8601 duration string (like P1DT2H30M) into seconds, with tests.",
     "prose": "Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle.",
