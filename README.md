@@ -21,8 +21,9 @@ single stream:
 
 | | decode |
 |---|---|
-| TabbyAPI (OpenAI endpoint, streaming, temperature 0.6) | **42-45 tok/s** (TTFT ~0.5 s) |
-| exllamav3 generator (`rocm_tests/moe_gen.py`) | 42 tok/s code and prose |
+| TabbyAPI (OpenAI endpoint, streaming, temperature 0.6), once placement has adapted | **53 tok/s** code, **46 tok/s** prose (TTFT ~0.5 s) |
+| TabbyAPI, first request after load (general-purpose placement) | 39-47 tok/s |
+| exllamav3 generator (`rocm_tests/moe_gen.py`), general-purpose placement | 46 tok/s code and prose |
 | llama.cpp, same GPU, IQ4_XS GGUF, `--n-cpu-moe 36` (reference) | 17.5 tok/s |
 
 Decode step, by the numbers (`rocm_tests/prof_step.py`, one token):
@@ -31,9 +32,9 @@ Decode step, by the numbers (`rocm_tests/prof_step.py`, one token):
 |---|---|---|
 | CPU expert kernel output | all zeros (bug) | correct |
 | gated-residual mix (96 sites) | 154 us/site | 26 us/site |
-| routed experts on GPU | per-expert launches + one host sync per layer | 5 launches per layer, no sync |
-| CPU share of expert activations | 68% (placement was effectively uniform) | 46% (frequency-guided) |
-| step time | 37.5 ms | ~22 ms |
+| routed + shared experts on GPU | per-expert launches + one host sync per layer | 7 launches per layer, no sync |
+| CPU share of expert activations | 68% (placement was effectively uniform) | 46% (frequency-guided), 25-28% once adapted to a coding session |
+| step time | 37.5 ms | ~20 ms (general placement) |
 
 The CPU side is bound by DRAM bandwidth: the expert kernel streams ~50 GB/s of the ~64 GB/s the platform
 reads. At 46% CPU share that is ~10 ms of CPU work per token, of which the GPU hides only the part that overlaps
@@ -104,6 +105,24 @@ Speed:
   each re-reading experts from disk between requests) and stayed near uniform placement in practice.
 - The fp16 source copies of the hyper-connection tables are released after load on ROCm (the prefill path
   now works from the folded copies): 1.3 GB VRAM, about 14 more GPU experts per layer.
+- Workload-adaptive placement. Offline, on 2000-token generations (`rocm_tests/route_trace.py`,
+  `place_sim.py`), general-purpose statistics leave 38-52% of decode picks on the CPU, while placement fitted
+  to the first half of the same task leaves 16-24% on the second half. The statistics now only seed the
+  order and dynamic swapping adapts it between requests. Swaps no longer re-read the checkpoint: with the
+  worker's expert arena shared and page-locked (now the default on Linux), the hot expert's block is DMA'd
+  out of RAM and unswizzled into the GPU slot, and the cold one is swizzled back into the same arena block
+  (~16 -> 1.6 ms per swap, verified bit-exact with `EXL3_MOE_CPU_SWAP_VERIFY=1`). A sweep after a request
+  takes ~0.5 s. The price is a domain switch: after a run of coding requests a chat request sees more CPU
+  experts than with the static order, until the next sweeps.
+- The shared expert runs inside the MoE decode pipeline (one extra pair per token, its own bitrate):
+  decode step 22.3 -> 20.0 ms.
+- n-gram table opened with `POSIX_FADV_RANDOM`: every page-cache miss used to pull a full readahead window
+  for a ~100-byte row (cold 16K prefill 156 -> 444 tok/s).
+
+Prefill is the weak spot: every 2048-token chunk needs all 512 experts of every layer, so the ~32 GB of
+CPU-resident experts cross PCIe once per chunk (~1.2 s), plus the n-gram rows from disk (prefetched one chunk
+ahead). Measured 450-800 tok/s depending on the page cache (32K prompt: ~40-70 s). Larger chunks would amortize
+the transfer but run out of VRAM beside 166 GPU experts per layer.
 
 Tried and not adopted: MTP drafting with CPU experts (acceptance 0.3-0.6 at temperature 0.6; a verify step
 touches the union of every drafted token's experts, so it ran slower than plain decoding).
