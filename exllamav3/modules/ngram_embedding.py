@@ -41,6 +41,7 @@ def _find_nth_prime_after(start: int, count: int) -> int:
     return p
 
 
+_ngram_prof = bool(os.environ.get("EXL3_NGRAM_PROF"))
 PREFETCH_ENABLED = os.environ.get("EXL3_NGRAM_PREFETCH", "1") != "0"   # debug/A-B switch
 PREFETCH_MIN_TOKENS = 256   # positions (bsz * seq) below which prefetch() declines (decode-sized)
 MAX_PIN_SETS = 2            # staging sets: one with the last forward's uploads in flight, one being staged
@@ -501,11 +502,18 @@ class NGramEmbedding(Module):
             # the previous forward's non_blocking uploads read this set; the generator issues
             # chunk forwards back to back with no host sync, so wait before rewriting it
             pin.event.synchronize()
+        prof = _ngram_prof and out_len > 1
+        if prof:
+            import time; t0 = time.perf_counter()
         U = ext.ngram_hash_cpu(
             history, out_len, self.layer_multipliers, self.head_offsets, self.head_vocab_sizes,
             self.heads_per_ngram, self.eos_token_id,
             pin.uids, pin.inverse, pin.heads)
+        if prof: t1 = time.perf_counter()
         self._gather_rows(pin.uids[:U], pin.packed[:U])
+        if prof:
+            t2 = time.perf_counter()
+            print(f" -- ngram stage: {out_len} pos, {U} rows, hash {(t1 - t0) * 1000:.1f} ms, gather {(t2 - t1) * 1000:.1f} ms", flush = True)
         return U
 
     def _match(self, history: torch.Tensor) -> dict | None:

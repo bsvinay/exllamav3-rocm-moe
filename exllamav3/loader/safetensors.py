@@ -295,6 +295,11 @@ class DiskTensorHandle:
                 self.fd = _win_open_stream(self.filename)
             else:
                 self.fd = os.open(self.filename, os.O_RDONLY)
+                # Row gathers are small scattered preads: without the hint every page-cache miss
+                # pulls a full readahead window (128 KB+ per ~100-byte row), which turned a
+                # 65K-row prefill gather into gigabytes of I/O and evicted useful cache
+                if hasattr(os, "posix_fadvise"):
+                    os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_RANDOM)
         return self.fd
 
     def close(self):

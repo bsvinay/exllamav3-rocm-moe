@@ -474,7 +474,7 @@ void gr_finalize_kernel
 // RDNA3 decode mix (R <= GR3_MAX_R): the NVIDIA-tuned kernels above run at ~90 GB/s on gfx1100
 // (few waves, each serializing a long register-resident chunk loop). Here phase A is one wave per
 // (fn row, stream) with its 8 x NCH halves in flight and the rows looped against the L2-resident
-// streams, a one-block head kernel derives rmr / the silu'd latent / post once, and phase B is one
+// streams, and phase B derives rmr / the silu'd latent / post per block from the dots and is one
 // wave per (column quad, stream) with the per-stream gates combined through LDS. 154 -> 26 us per
 // site at one row (Qwen3.8-Flash-Next, 13 MB of fp16 tables per site).
 #ifdef __HIP_PLATFORM_AMD__
@@ -533,55 +533,45 @@ void dots_kernel(const float* __restrict__ streams, const half* __restrict__ fn,
     }
 }
 
-// rmr (R, H), silu'd latent t (R, LR) and the optional inject gates, once per site
-__global__ __launch_bounds__(256)
-void head_kernel(const float* __restrict__ dots, float* __restrict__ t, float* __restrict__ rmr, float* __restrict__ post,
-                 const int M, const int D, const int LR, const int R, const float rms_eps)
-{
-    constexpr int H = 4;
-    __shared__ float rm[GR3_MAX_R * H];
-    for (int i = threadIdx.x; i < R * H; i += 256)
-    {
-        const int r = i / H, h = i % H;
-        rm[i] = rsqrtf(dots[((size_t) r * (M + 1) + M) * H + h] / (float) D + rms_eps);
-        rmr[i] = rm[i];
-    }
-    __syncthreads();
-    const float inv_h = 1.0f / (float) H;
-    for (int idx = threadIdx.x; idx < R * LR; idx += 256)
-    {
-        const int r = idx / LR, i = idx % LR;
-        const float* dr = dots + ((size_t) r * (M + 1) + i) * H;
-        float v = 0.0f;
-        #pragma unroll
-        for (int h = 0; h < H; ++h) v = fmaf(rm[r * H + h], dr[h], v);
-        v *= inv_h;
-        t[idx] = v * sigmoidf_(v);
-    }
-    if (post)
-        for (int i = threadIdx.x; i < R * H; i += 256)
-        {
-            const int r = i / H, h = i % H;
-            const float* dr = dots + ((size_t) r * (M + 1) + LR + h) * H;
-            float v = 0.0f;
-            #pragma unroll
-            for (int hh = 0; hh < H; ++hh) v = fmaf(rm[r * H + hh], dr[hh], v);
-            post[i] = 2.0f * sigmoidf_(v * inv_h);
-        }
-}
-
 // Two column quads per block, one wave per (quad, stream): the (stream, quad) up slab is LR x 4
 // contiguous halves, lane l holding ranks 64 it + 2 l, +1
+// The head (rmr, silu'd latent, inject gates) is derived per block from the dots in L2 (the
+// separate head launch cost more than the redundant reads)
 template <int NIT, bool HALF_OUT>
 __global__ __launch_bounds__(256)
-void finalize_kernel(const float* __restrict__ streams, const float* __restrict__ tg, const float* __restrict__ rmr,
+void finalize_kernel(const float* __restrict__ streams, const float* __restrict__ dots, float* __restrict__ post,
                      const half* __restrict__ upt, const half* __restrict__ w, void* __restrict__ mixed,
-                     const int D, const int R)
+                     const int M, const int D, const int R, const float rms_eps)
 {
     constexpr int H = 4, QPB = 2, LR = NIT * 64;
     __shared__ float ts[GR3_MAX_R * LR];
+    __shared__ float rmr[GR3_MAX_R * H];
     __shared__ float4 gs[QPB][H];
-    for (int i = threadIdx.x; i < R * LR; i += 256) ts[i] = tg[i];
+    for (int i = threadIdx.x; i < R * H; i += 256)
+    {
+        const int r = i / H, h = i % H;
+        rmr[i] = rsqrtf(dots[((size_t) r * (M + 1) + M) * H + h] / (float) D + rms_eps);
+    }
+    __syncthreads();
+    {
+        const float inv_h = 1.0f / (float) H;
+        for (int idx = threadIdx.x; idx < R * LR; idx += 256)
+        {
+            const int r = idx / LR, i = idx % LR;
+            const float4 d = *(const float4*) (dots + ((size_t) r * (M + 1) + i) * H);
+            float v = rmr[r * H] * d.x + rmr[r * H + 1] * d.y + rmr[r * H + 2] * d.z + rmr[r * H + 3] * d.w;
+            v *= inv_h;
+            ts[idx] = v * sigmoidf_(v);
+        }
+        if (post && blockIdx.x == 0)
+            for (int i = threadIdx.x; i < R * H; i += 256)
+            {
+                const int r = i / H, h = i % H;
+                const float4 d = *(const float4*) (dots + ((size_t) r * (M + 1) + LR + h) * H);
+                const float v = rmr[r * H] * d.x + rmr[r * H + 1] * d.y + rmr[r * H + 2] * d.z + rmr[r * H + 3] * d.w;
+                post[i] = 2.0f * sigmoidf_(v * inv_h);
+            }
+    }
     __syncthreads();
     const int wv = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int q = wv >> 2, h = wv & 3;
@@ -641,8 +631,6 @@ void finalize_kernel(const float* __restrict__ streams, const float* __restrict_
     }
 }
 
-float* g_scratch[16] = {};   // per device: t (GR3_MAX_R, 1024) and rmr (GR3_MAX_R, 4)
-
 // Returns false if the shape is not covered
 bool launch(const float* s_p, const half* fn_p, const half* up_p, const half* w_p, float* dots_p, float* post_p,
             void* mixed_p, bool hout, int R, int M, int D, int LR, float rms_eps, cudaStream_t stream)
@@ -651,12 +639,6 @@ bool launch(const float* s_p, const half* fn_p, const half* up_p, const half* w_
     if (!enabled || R > GR3_MAX_R || LR % 64 || LR > 1024 || D % 256) return false;
     const int nch = D / 256, nit = LR / 64;
     if (!(nch == 10 || nch == 16 || nch == 20) || !(nit == 5 || nit == 8 || nit == 16)) return false;
-    int device;
-    cuda_check(cudaGetDevice(&device));
-    if (device >= 16) return false;
-    if (!g_scratch[device]) cuda_check(cudaMalloc(&g_scratch[device], (GR3_MAX_R * 1024 + GR3_MAX_R * 4) * sizeof(float)));
-    float* t_p = g_scratch[device];
-    float* rmr_p = t_p + GR3_MAX_R * 1024;
     const int grid_a = (M + 1) / 2 + 1;
     switch (nch)
     {
@@ -664,11 +646,10 @@ bool launch(const float* s_p, const half* fn_p, const half* up_p, const half* w_
         case 16: dots_kernel<16><<<grid_a, 256, 0, stream>>>(s_p, fn_p, dots_p, M, D, R); break;
         case 20: dots_kernel<20><<<grid_a, 256, 0, stream>>>(s_p, fn_p, dots_p, M, D, R); break;
     }
-    head_kernel<<<1, 256, 0, stream>>>(dots_p, t_p, rmr_p, post_p, M, D, LR, R, rms_eps);
     const int grid_c = D / 4 / 2;
     #define GR3_FIN(NIT) \
-        if (hout) finalize_kernel<NIT, true><<<grid_c, 256, 0, stream>>>(s_p, t_p, rmr_p, up_p, w_p, mixed_p, D, R); \
-        else      finalize_kernel<NIT, false><<<grid_c, 256, 0, stream>>>(s_p, t_p, rmr_p, up_p, w_p, mixed_p, D, R);
+        if (hout) finalize_kernel<NIT, true><<<grid_c, 256, 0, stream>>>(s_p, dots_p, post_p, up_p, w_p, mixed_p, M, D, R, rms_eps); \
+        else      finalize_kernel<NIT, false><<<grid_c, 256, 0, stream>>>(s_p, dots_p, post_p, up_p, w_p, mixed_p, M, D, R, rms_eps);
     switch (nit)
     {
         case 5:  GR3_FIN(5) break;

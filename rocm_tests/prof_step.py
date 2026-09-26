@@ -19,7 +19,7 @@ def main():
     cache = Cache(model, max_num_tokens = 4096, max_batch_size = 1)
     model.load(progressbar = False)
     tok = Tokenizer.from_config(config)
-    ids = tok.encode(open(os.path.expanduser("~/wikitext2_test.txt")).read()[5000:20000])[:, :300]
+    ids = tok.encode(open(os.path.expanduser("~/wikitext2_test.txt")).read()[5000:60000])[:, :200 + args.steps]
 
     ev = []
     on = [False]
@@ -57,17 +57,19 @@ def main():
     model.prefill(input_ids = ids[:, :P], params = params)
     rs = params.get("recurrent_states")
     torch.cuda.synchronize()
-    times = []
+    times = []; enq = []
     for s in range(args.steps):
         pos = P + s
         p = {"attn_mode": "flash_attn", "cache": cache, "past_len": pos, "batch_shape": (1, 4096), "recurrent_states": rs}
         on[0] = s >= 4
         t0 = time.perf_counter()
         model.forward(input_ids = ids[:, pos:pos + 1], params = p)
+        t1 = time.perf_counter()
         torch.cuda.synchronize()
-        if s >= 4: times.append(time.perf_counter() - t0)
+        if s >= 4: times.append(time.perf_counter() - t0); enq.append(t1 - t0)
     n = len(times)
-    print(f"step: median {sorted(times)[n // 2] * 1000:.2f} ms ({1 / sorted(times)[n // 2]:.1f} tok/s)")
+    print(f"step: median {sorted(times)[n // 2] * 1000:.2f} ms ({1 / sorted(times)[n // 2]:.1f} tok/s), "
+          f"host enqueue median {sorted(enq)[n // 2] * 1000:.2f} ms")
     agg = collections.defaultdict(lambda: [0.0, 0.0, 0])
     for name, e0, e1, host in ev:
         a = agg[name]; a[0] += e0.elapsed_time(e1); a[1] += host * 1000; a[2] += 1
