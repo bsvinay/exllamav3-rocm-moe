@@ -11,6 +11,7 @@ def main():
     ap.add_argument("--mct", type = int, default = 12)
     ap.add_argument("--steps", type = int, default = 24)
     ap.add_argument("--nohooks", action = "store_true")
+    ap.add_argument("--settle", type = float, default = 0.0, help = "seconds to wait after load")
     args = ap.parse_args()
     config = Config.from_directory(args.model)
     if args.mcs: config.infer_params.moe_cpu_split = args.mcs
@@ -19,6 +20,7 @@ def main():
     cache = Cache(model, max_num_tokens = 4096, max_batch_size = 1)
     model.load(progressbar = False)
     tok = Tokenizer.from_config(config)
+    if args.settle: time.sleep(args.settle)
     ids = tok.encode(open(os.path.expanduser("~/wikitext2_test.txt")).read()[5000:60000])[:, :200 + args.steps]
 
     ev = []

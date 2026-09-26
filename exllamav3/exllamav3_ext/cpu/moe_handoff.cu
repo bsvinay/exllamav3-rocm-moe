@@ -5,6 +5,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <thread>
@@ -89,6 +90,17 @@ struct MemOps
     {
         // Symbol resolution is unconditional (independent of exl3_moe_cpu_set_memops): whether
         // the ops are used is a separate, mutable runtime switch, not a one-time decision
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+        // HIP exports the stream memory operations from the runtime itself (the hipified dlopen
+        // of the CUDA driver names looked in librocr and never resolved, so every flag wait and
+        // write ran as a kernel)
+        wait = [] (hipStream_t st, void* p, cuuint32_t v, unsigned int flags, uint32_t mask) -> hipError_t
+            { return hipStreamWaitValue32(st, p, v, flags, mask); };
+        write = [] (hipStream_t st, void* p, cuuint32_t v, unsigned int flags) -> hipError_t
+            { return hipStreamWriteValue32(st, p, v, flags); };
+        resolved = std::getenv("EXL3_MOE_HIP_MEMOPS") == nullptr || std::getenv("EXL3_MOE_HIP_MEMOPS")[0] != '0';
+        return;
+#endif
 #ifdef __linux__
         void* h = dlopen("librocr.so", RTLD_LAZY);
         if (!h) h = dlopen("librocr.so", RTLD_LAZY);
