@@ -117,6 +117,10 @@ Speed:
   (~16 -> 1.6 ms per swap, verified bit-exact with `EXL3_MOE_CPU_SWAP_VERIFY=1`). A sweep after a request
   takes ~0.5 s. The price is a domain switch: after a run of coding requests a chat request sees more CPU
   experts than with the static order, until the next sweeps.
+- The learned placement persists: each sweep folds the hit histograms into an exponential average over
+  checkpoint expert ids and writes `expert_stats_learned.json` next to the model, which the next load uses as
+  its starting order (`EXL3_MOE_LEARN=0` disables). After a restart the first coding request already runs at
+  a CPU share of 0.15 (0.47 from the shipped statistics), chat at 0.42, and sweeps shrink to 0.1-0.4 s.
 - The shared expert runs inside the MoE decode pipeline (one extra pair per token, its own bitrate):
   decode step 22.3 -> 20.0 ms.
 - n-gram table opened with `POSIX_FADV_RANDOM`: every page-cache miss used to pull a full readahead window

@@ -75,6 +75,7 @@ def run_pending_swap_sweeps(infer_params):
         for h in {m.cpu_host for m in reg}:
             assert int(h.v_jobs_head[0]) == int(h.v_jobs_tail[0]), \
                 "swap sweep: job ring not drained after all-device sync"
+    _learn_placement(reg)
     # Budget per sweep, spread evenly over the layers (first-come let the early layers take it all)
     import time
     t0 = time.perf_counter()
@@ -92,6 +93,43 @@ def _moe_arena_swizzle():
     from ..model.moe_cpu_host import TUNING
     from ..ext import exllamav3_ext as ext
     return TUNING.swizzle and ext.exl3_moe_cpu_has_avx512_bw()
+
+
+_learned = {}
+
+def _learn_placement(reg):
+    """Fold each split layer's decode hit histogram (router order) into an exponential average
+    over checkpoint expert ids, seeded from the stats file the placement started from, and write
+    it to <model dir>/expert_stats_learned.json. The next load seeds its placement from that file,
+    so a restarted server starts out adapted to its recent workload (EXL3_MOE_LEARN=0 disables)"""
+    if os.environ.get("EXL3_MOE_LEARN", "1") == "0" or not reg:
+        return
+    import json
+    alpha = float(os.environ.get("EXL3_MOE_LEARN_RATE", 0.25))
+    for m in reg:
+        hist = m._split_hist.float().cpu()
+        tot = float(hist.sum())
+        if tot <= 0:
+            continue
+        perm = m._split_perm
+        cur = torch.zeros(m.num_experts)
+        if perm is not None:
+            cur[torch.tensor(perm)] = hist / tot
+        else:
+            cur = hist / tot
+        prev = _learned.get(m.key)
+        if prev is None:
+            prev = getattr(m, "_split_seed", None)
+            prev = prev / prev.sum() if prev is not None and prev.sum() > 0 else cur
+        _learned[m.key] = (1.0 - alpha) * prev + alpha * cur
+    try:
+        path = os.path.join(reg[0].config.directory, "expert_stats_learned.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({k: [int(round(float(x) * 1e8)) for x in v] for k, v in _learned.items()}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 class BlockSparseMLP_CPU:
@@ -312,9 +350,11 @@ class BlockSparseMLP_CPU:
         stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
         swap_env = os.environ.get("EXL3_MOE_CPU_SWAP")
         if stats_path is None and self.config is not None:
-            auto = os.path.join(self.config.directory, "expert_stats.json")
-            if os.path.exists(auto):
-                stats_path = auto
+            for name in ("expert_stats_learned.json", "expert_stats.json"):
+                auto = os.path.join(self.config.directory, name)
+                if os.path.exists(auto):
+                    stats_path = auto
+                    break
         return stats_path, (swap_env or "1") != "0"
 
     @override
@@ -509,6 +549,7 @@ class BlockSparseMLP_CPU:
             import json
             counts = json.load(open(stats_path)).get(self.key)
             if counts is not None and len(counts) == self.num_experts:
+                self._split_seed = torch.tensor(counts, dtype = torch.float)
                 perm = sorted(range(self.num_experts), key = lambda e: -counts[e])
                 self._split_perm = perm
                 if self.gated:
