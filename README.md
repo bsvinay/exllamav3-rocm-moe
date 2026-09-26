@@ -21,8 +21,9 @@ single stream:
 
 | | decode |
 |---|---|
-| TabbyAPI (OpenAI endpoint, streaming, temperature 0.6), once placement has adapted | **53 tok/s** code, **46 tok/s** prose (TTFT ~0.5 s) |
-| TabbyAPI, first request after load (general-purpose placement) | 39-47 tok/s |
+| TabbyAPI (OpenAI endpoint, temperature 0.6), MTP drafting (2 tokens), placement adapted | **74 tok/s** code, **50 tok/s** prose (TTFT ~0.4 s) |
+| TabbyAPI, no drafting, placement adapted | 53 tok/s code, 46 tok/s prose |
+| TabbyAPI, MTP, first request after load (general-purpose placement) | 52 tok/s code, 45 tok/s prose |
 | exllamav3 generator (`rocm_tests/moe_gen.py`), general-purpose placement | 46 tok/s code and prose |
 | llama.cpp, same GPU, IQ4_XS GGUF, `--n-cpu-moe 36` (reference) | 17.5 tok/s |
 
@@ -62,11 +63,13 @@ model:
   max_seq_len: 131072
   cache_size: 131072
   cache_mode: Q8
-  cpu_moe_split_experts: 346   # experts per layer on the CPU
+  cpu_moe_split_experts: 362   # experts per layer on the CPU (346 without MTP)
   cpu_moe_threads: 12
   vision: false                # the 3.05bpw branch ships no vision tower
 draft_model:
-  draft_mode: disabled
+  draft_mode: mtp              # the model's own MTP layer; "disabled" for plain decoding
+  draft_num_tokens: 2
+  draft_cache_mode: Q8
 ```
 
 Run TabbyAPI with `EXL3_NOGRAPH=mlp,gdn,moe`. Memory at this setting: 21.9 GB VRAM, ~33 GB RAM for the CPU
@@ -124,8 +127,13 @@ CPU-resident experts cross PCIe once per chunk (~1.2 s), plus the n-gram rows fr
 ahead). Measured 450-800 tok/s depending on the page cache (32K prompt: ~40-70 s). Larger chunks would amortize
 the transfer but run out of VRAM beside 166 GPU experts per layer.
 
-Tried and not adopted: MTP drafting with CPU experts (acceptance 0.3-0.6 at temperature 0.6; a verify step
-touches the union of every drafted token's experts, so it ran slower than plain decoding).
+MTP drafting pays off since the decode path got cheaper: with 2 draft tokens, acceptance is ~0.9 on code
+(46 -> 60 tok/s in the generator, 74 through TabbyAPI with adapted placement) and ~0.55 on prose (roughly
+break-even). A verify step touches the union of the drafted tokens' experts, which is why 3 draft tokens and
+dynamic drafting were not better. Before the kernel work MTP was a net loss.
+
+The CPU <-> GPU handoff flags now use HIP stream memory operations (the hipified lookup of the CUDA driver
+symbols never resolved, so every wait and write ran as a kernel): decode step 21.3 -> 19.4 ms.
 
 ---
 
