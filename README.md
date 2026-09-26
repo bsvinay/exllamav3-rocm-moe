@@ -1,18 +1,116 @@
-# exllamav3 on AMD RDNA3 (ROCm port)
+# exllamav3 on AMD RDNA3: large MoE models with CPU / RAM / SSD offload
 
-A ROCm/HIP port of [exllamav3](https://github.com/turboderp-org/exllamav3) for RDNA3 GPUs (tested on a
-Radeon RX 7900 XTX, gfx1100), with RDNA3-specific kernels for the EXL3 matmul and for decode attention.
-It runs Qwen3.8-27B EXL3 with **DFlash2** or **MTP** speculative decoding, **vision**, reasoning and an
-**8-bit KV cache at 192K-256K context** on a single 24 GB card, served through a lightly patched
-[TabbyAPI](https://github.com/theroyallab/tabbyAPI).
+This repository is the MoE branch of [exllamav3-rocm](https://github.com/phoenixhaxor/exllamav3-rocm) (a
+ROCm/HIP port of [exllamav3](https://github.com/turboderp-org/exllamav3) for RDNA3). It adds what it takes to
+run a model much larger than the GPU, **Qwen3.8-Flash-Next** (125B MoE, 512 experts, 6B active, plus a 51B
+hashed n-gram embedding table), on one RX 7900 XTX (24 GB) with 60 GB of system RAM:
 
-Upstream exllamav3 is CUDA-only: its EXL3 kernels are built on `mma.sync`, `ldmatrix`, `cp.async` and
-cooperative launches, and TabbyAPI refuses AMD GPUs. This fork keeps the upstream Python stack and model
-format unchanged and replaces the pieces that do not map to RDNA3.
+- the hottest experts of every layer stay in VRAM, the rest run on the CPU (AVX-512 VNNI/VBMI kernel reading
+  EXL3 `mul1` weights straight from RAM), overlapped with the GPU's own experts;
+- the n-gram embedding table (33 GB at 3.05 bpw) stays on disk and is gathered per token from the page cache;
+- RDNA3 kernels for the MoE decode path, the gated-residual hyper-connections and the router.
 
-The original upstream README is kept as [README.exllamav3.md](README.exllamav3.md).
+Everything from the dense port (Qwen3.8-27B, DFlash2/MTP drafting, RDNA3 EXL3 matmul, decode attention) is
+unchanged and documented further down.
+
+## Qwen3.8-Flash-Next results (RX 7900 XTX, Ryzen 9 7950X3D, 60 GB DDR5, ROCm 7.2.4)
+
+[turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3), branch
+`3.05bpw_h5_ng5`, 128K context with 8-bit KV cache, 166 of 512 experts per layer on the GPU, 12 CPU threads,
+single stream:
+
+| | decode |
+|---|---|
+| TabbyAPI (OpenAI endpoint, streaming, temperature 0.6) | **42-45 tok/s** (TTFT ~0.5 s) |
+| exllamav3 generator (`rocm_tests/moe_gen.py`) | 42 tok/s code and prose |
+| llama.cpp, same GPU, IQ4_XS GGUF, `--n-cpu-moe 36` (reference) | 17.5 tok/s |
+
+Decode step, by the numbers (`rocm_tests/prof_step.py`, one token):
+
+| stage | before | now |
+|---|---|---|
+| CPU expert kernel output | all zeros (bug) | correct |
+| gated-residual mix (96 sites) | 154 us/site | 26 us/site |
+| routed experts on GPU | per-expert launches + one host sync per layer | 5 launches per layer, no sync |
+| CPU share of expert activations | 68% (placement was effectively uniform) | 46% (frequency-guided) |
+| step time | 37.5 ms | ~22 ms |
+
+The CPU side is bound by DRAM bandwidth: the expert kernel streams ~50 GB/s of the ~64 GB/s the platform
+reads. At 46% CPU share that is ~10 ms of CPU work per token, of which the GPU hides only the part that overlaps
+its own experts of the same layer (a layer's experts depend on its attention output, and the next layer on
+all of them). More VRAM for experts is therefore the main lever: each extra GPU expert per layer costs ~88 MB.
+
+## Running Flash-Next
+
+```bash
+# download (85 GB), then collect the per-layer expert statistics once (writes expert_stats.json into the model dir;
+# a copy for this model is in rocm_tests/expert_stats/)
+hf download turboderp/Qwen3.8-Flash-Next-exl3 --revision 3.05bpw_h5_ng5 --local-dir models/Qwen3.8-Flash-Next-3.05bpw
+python rocm_tests/moe_stats.py -m models/Qwen3.8-Flash-Next-3.05bpw
+
+# generate: 346 of 512 experts per layer on the CPU (166 on the GPU), 12 worker threads
+EXL3_NOGRAPH=mlp,gdn,moe python rocm_tests/moe_gen.py -m models/Qwen3.8-Flash-Next-3.05bpw \
+    --mcs 346 --mct 12 --cache 131072 --kv_bits 8
+```
+
+TabbyAPI (`config.yml`, model section):
+
+```yaml
+model:
+  model_name: Qwen3.8-Flash-Next-exl3-3.05bpw
+  max_seq_len: 131072
+  cache_size: 131072
+  cache_mode: Q8
+  cpu_moe_split_experts: 346   # experts per layer on the CPU
+  cpu_moe_threads: 12
+  vision: false                # the 3.05bpw branch ships no vision tower
+draft_model:
+  draft_mode: disabled
+```
+
+Run TabbyAPI with `EXL3_NOGRAPH=mlp,gdn,moe`. Memory at this setting: 21.9 GB VRAM, ~33 GB RAM for the CPU
+experts, the rest of RAM as page cache for the n-gram table.
+
+## What the MoE work changed
+
+Correctness (all found by comparing cached decode logits against a no-cache prefill, `rocm_tests/decode_diff.py`):
+
+- **CPU experts returned zeros.** The activation clamp used `+inf` as "no limit"; the extension builds with
+  `-Ofast`, whose finite-math assumption lets clang fold `min(x, inf)` / `clamp(u, -inf, inf)` to 0. Now
+  `FLT_MAX`. The ISA-tier test compared tiers against each other, so all-zero tiers passed; it now rejects
+  all-zero outputs.
+- **Shared-expert gate.** `block_reduce_sum_broadcast_f` stored the result from every lane of warp 0 into one
+  shared slot; after a `shfl_down` reduction only lane 0 holds the sum, and on RDNA3 another lane won.
+- Kernels that cannot launch on gfx11 (64 KB LDS per workgroup) are routed around: the deterministic int8
+  router GEMM (97 KB) and the fused `exl3_moe` prefill kernel (90 KB). The fused decode kernels
+  (`run_bszN`, NVIDIA `mma` emulated) still give wrong results on RDNA3 and are bypassed.
+- Expert placement from a stats file permutes the router rows after load, so those rows must not be
+  deferred-loaded.
+
+Speed:
+
+- `exl3_rdna3_moe_decode` (quant/exl3_rdna3.cu): the routed experts of a decode batch (up to 16 tokens) as
+  prep -> gate/up matmul -> activation -> down matmul -> fixed-order combine, one matmul entry per
+  (token, slot) with device-built pointer tables. Entries whose expert lives on the CPU get a null pointer
+  and the RDNA3 matmul kernel skips them. No host round trip (the generic path read expert counts back
+  every layer).
+- `gr_mix` on gfx11 (hc_mix.cu): the Qwen3.8-Flash-Next hyper-connection mix (4 streams, rank 320, 13 MB of
+  fp16 tables per site) ran at ~90 GB/s with the NVIDIA-tuned kernels. One wave per (row, stream) for the
+  projection, a one-block head kernel, one wave per (column quad, stream) for the up-gate: 154 -> 26 us.
+- Router GEMV with 16-byte loads.
+- Frequency-guided placement: `rocm_tests/moe_stats.py` counts router selections per layer on the model's own
+  qbench conversations plus text; an `expert_stats.json` in the model directory then keeps each layer's
+  hottest experts in VRAM. The default dynamic hot/cold swapping converges slowly (bounded swaps per sweep,
+  each re-reading experts from disk between requests) and stayed near uniform placement in practice.
+- The fp16 source copies of the hyper-connection tables are released after load on ROCm (the prefill path
+  now works from the folded copies): 1.3 GB VRAM, about 14 more GPU experts per layer.
+
+Tried and not adopted: MTP drafting with CPU experts (acceptance 0.3-0.6 at temperature 0.6; a verify step
+touches the union of every drafted token's experts, so it ran slower than plain decoding).
 
 ---
+
+# Dense models (Qwen3.8-27B)
 
 ## Results (RX 7900 XTX 24 GB, ROCm 7.2.4, PyTorch 2.13.0+rocm7.2)
 
