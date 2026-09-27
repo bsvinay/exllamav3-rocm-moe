@@ -37,6 +37,18 @@ single stream:
 | TabbyAPI, MTP, learned placement | **68 tok/s** code, 42 tok/s prose (60 / 37 on the first request) |
 | exllamav3 generator | 62 tok/s code, 45 tok/s prose |
 
+Context, KV cache and vision (TabbyAPI, both variants, MTP, KV cache Q8 for the model and the MTP layer,
+like the dense profile):
+
+| | 3.05 bpw | 4.05 bpw |
+|---|---|---|
+| 192K context: GPU experts per layer / VRAM | 156 / 22.0 GB | 116 / 22.3 GB |
+| decode, code / prose (after the first request) | 81 / 56 tok/s | 65 / 44 tok/s |
+| 262K (native maximum) | fits with fewer GPU experts | fits at 106 GPU experts / 22.3 GB |
+| vision | not in the 3.05 branch | yes (`vision_k6`), `vision_offload: true` keeps the tower in pinned RAM, ~2 s per image request |
+
+A Q4 cache for the MTP layer saves almost nothing (one attention layer) and did not help acceptance.
+
 Decode step, by the numbers (`rocm_tests/prof_step.py`, one token):
 
 | stage | before | now |
