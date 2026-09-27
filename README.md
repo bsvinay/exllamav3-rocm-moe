@@ -158,6 +158,31 @@ MTP drafting pays off since the decode path got cheaper: with 2 draft tokens, ac
 break-even). A verify step touches the union of the drafted tokens' experts, which is why 3 draft tokens and
 dynamic drafting were not better. Before the kernel work MTP was a net loss.
 
+Drafting and placement additions (4.05 bpw, measured with `rocm_tests/speed_ab.py` / `gen_check.py`; the prompt
+lookup and mid-generation adaptation ideas come from [Strata](https://github.com/Niko1221/Strata)):
+
+- **Gumbel-coupled MTP drafts** (`EXL3_MTP_COUPLED`, default on). Under temperature sampling the MTP used to draft
+  its argmax, accepted with the target's probability of that token. Now, for a single job whose verification
+  window is presampled, the round draws its noise seed before drafting and the MTP samples each draft position
+  with the job's own sampler and the Gumbel noise the target uses at that position. The target's samples are
+  unchanged (each position still gets fresh noise), so the output distribution is exact
+  (`rocm_tests/dist_check.py`: coupled vs uncoupled token distributions differ no more than two uncoupled runs);
+  the draft simply agrees with them more often. Prose at temperature 1.0 / top-k 20 / top-p 0.95, three seeds:
+  acceptance 0.48 -> 0.58, 1.96 -> 2.16 tokens per round.
+- **Prompt lookup beside MTP** (`EXL3_MTP_LOOKUP=4`, `EXL3_MTP_LOOKUP_MAX=4`). When the last 4+ tokens occurred
+  earlier in the context, a round drafts the continuation of that copy (up to 4 tokens) instead of running
+  the MTP layer; the MTP K/V of the accepted positions is written from the target's hidden states afterwards.
+  The match threshold tunes itself (+2 when a lookup round loses more than half its draft, -1 when all of it
+  is accepted), so free text rarely triggers it. Rewriting a source file with a small change: 44.9 -> 90.3
+  tok/s greedy (4.97 tokens per round, 99.7% accepted), 54 -> 76 tok/s sampled; prose unchanged. A window of
+  6 was slower than 4 (7-row verification). Needs a recurrent rollback history of the window
+  (`max_history`, ~113 MB of GDN state per step: 4 more CPU experts per layer at 192K).
+- **Placement adapts mid-generation.** Pending swap sweeps also run between two forward passes of a long
+  generation (`EXL3_MOE_CPU_SWAP_MIDSTREAM_MAX`, default 96 swaps), not only when the queue drains; generation
+  fidelity is unchanged (argmax agreement vs a prefill reference 0.9758, same as without swaps). Sweeps build
+  their hot/cold lists without per-element tensor reads and persist the learned placement only between
+  generations (0.25 -> 0.20 s per 98 swaps).
+
 The CPU <-> GPU handoff flags now use HIP stream memory operations (the hipified lookup of the CUDA driver
 symbols never resolved, so every wait and write ran as a kernel): decode step 21.3 -> 19.4 ms.
 
@@ -388,6 +413,9 @@ verification from ~45 ms to ~14 ms per round.
 | `attn_pf_bench.py` | prefill attention microbenchmark with a torch reference |
 | `api_test.py <url> <image>`, `needle_api.py <n> <depth>` | OpenAI API smoke test, long-context retrieval |
 | `vram.py <ctx> <kv_bits> <draft_kv_bits>` | VRAM per component |
+| `gen_check.py -m <model> [--mtp] [--task edit] [--temp T]`, `gen_check_mt.py` | generation fidelity at long context: generated tokens vs the argmax of a chunked-prefill reference, per window (flat ~0.975 greedy when healthy); `_mt`: multi-turn with recurrent-state restore |
+| `speed_ab.py -m <model> [--task edit] [--seeds 1,2,3]` | paired decode-speed A/B of Gumbel coupling and prompt lookup in one process |
+| `dist_check.py -m <model>` | token-distribution check of coupled vs uncoupled speculative sampling |
 
 Model paths default to `models/...` or `EXL3_MODEL_DIR` / `EXL3_DRAFT_DIR`. Greedy speculative decoding
 produces the same text as plain decoding for the DFlash2 path in these tests.

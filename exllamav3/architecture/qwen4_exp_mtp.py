@@ -181,6 +181,9 @@ class Qwen4ExpMTPModel(Model):
         lm = self.attached_model().modules[ll]
         logits = lm.prepare_for_device(state, params)
         logits = lm.forward(logits, params)
+        draft_sample = params.get("draft_sample")
+        if draft_sample is not None and not params.get("export_draft_conf"):
+            return draft_sample(logits)
         if params.get("export_draft_conf"):
             logits = logits[..., :self.attached_model().config.vocab_size]
             conf, ids = torch.max(logits, dim = -1)

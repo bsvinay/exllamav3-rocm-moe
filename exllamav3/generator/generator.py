@@ -16,6 +16,8 @@ from .draft_confidence import DraftConfidenceCalibrator
 import os
 _presample_enable = os.environ.get("EXL3_PRESAMPLE", "1") != "0"
 _adapt_window_enable = os.environ.get("EXL3_ADAPT_WINDOW", "0") == "1"   # off: +4% prose, -3% code
+_swap_midstream = os.environ.get("EXL3_MOE_CPU_SWAP_MIDSTREAM", "1") != "0"
+_mtp_coupled = os.environ.get("EXL3_MTP_COUPLED", "1") != "0"
 from .adaptive_window import AdaptiveWindow
 _draft_nb_enable = os.environ.get("EXL3_DRAFT_NB", "1") != "0"
 from .job import Job
@@ -176,9 +178,33 @@ class Generator:
             self.num_draft_tokens = 0
 
         self.ngram_match_min = ngram_match_min
+
+        # Prompt lookup beside an MTP drafter (EXL3_MTP_LOOKUP=N): when the last N+ tokens occurred earlier in
+        # the context, a round drafts the continuation of that earlier copy (up to EXL3_MTP_LOOKUP_MAX tokens,
+        # bounded by the cache's recurrent rollback history) instead of running the MTP layer. Verification is
+        # unchanged, so the output is too; only rounds with a longer continuation than the MTP window use it
+        self.mtp_lookup_min = 0
+        self.mtp_lookup_max = 0
+        if draft_model is not None and draft_model.caps.get("mtp_draft", False):
+            self.mtp_lookup_min = int(os.environ.get("EXL3_MTP_LOOKUP", 0))
+            if self.mtp_lookup_min > 0:
+                self.mtp_lookup_max = int(os.environ.get("EXL3_MTP_LOOKUP_MAX", 5))
+                if cache.max_history > 0:
+                    self.mtp_lookup_max = min(self.mtp_lookup_max, cache.max_history)
+                if self.mtp_lookup_max <= self.num_draft_tokens:
+                    self.mtp_lookup_min = self.mtp_lookup_max = 0
+        self.mtp_lookup_minlen = int(os.environ.get("EXL3_MTP_LOOKUP_MINLEN", self.num_draft_tokens + 1))
+        self.draft_headroom = max(self.num_draft_tokens, self.mtp_lookup_max)
+        self._lookup_round = None
+        self._lookup_len = 0
+        self.lookup_stats = [0, 0, 0]   # rounds, drafted, accepted
+        # Self-tuning match threshold: a lookup round that loses more than half its draft raises the
+        # suffix length a match needs by 2, a fully accepted one lowers it by 1 (never below mtp_lookup_min).
+        # Spurious short matches in free text then stop drafting while long copies (code edits) keep it
+        self.lookup_thresh = self.mtp_lookup_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
-        max_q_size = max(self.num_draft_tokens + 1, max_q_size)
+        max_q_size = max(self.draft_headroom + 1, max_q_size)
 
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
@@ -531,6 +557,19 @@ class Generator:
         assert self.draft_cache is None or self.draft_cache.initialized, \
             "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
 
+        # Dynamic expert placement: a sweep that falls due during a long generation runs here, between two
+        # forward passes, with a small budget, so placement keeps following the conversation instead of
+        # waiting for the queue to drain (EXL3_MOE_CPU_SWAP_MIDSTREAM=0: between generations only)
+        if _swap_midstream and self.active_jobs and \
+                getattr(self.model.config.infer_params, "moe_cpu_swap_pending", False):
+            from ..modules.block_sparse_mlp_cpu import run_pending_swap_sweeps
+            with torch.inference_mode():
+                run_pending_swap_sweeps(
+                    self.model.config.infer_params,
+                    budget = int(os.environ.get("EXL3_MOE_CPU_SWAP_MIDSTREAM_MAX", 96)),
+                    learn = False,
+                )
+
         results = []
         self.iterate_start_jobs(results)
 
@@ -551,8 +590,13 @@ class Generator:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
                 self.iterate_gen(results, draft_tokens)
             elif self.mtp_draft:
-                draft_tokens = self.iterate_draftmodel_mtp_gen(results)
+                for job in self.active_jobs:
+                    job.coupled_base = None
+                draft_tokens = self.iterate_mtp_lookup() if self.mtp_lookup_min else None
+                if draft_tokens is None:
+                    draft_tokens = self.iterate_draftmodel_mtp_gen(results)
                 self.iterate_gen(results, draft_tokens)
+                self._lookup_round = None
             else:
                 draft_tokens = self.iterate_draftmodel_gen(results)
                 self.iterate_gen(results, draft_tokens)
@@ -585,9 +629,9 @@ class Generator:
         if self.recurrent_cache is not None:
             self.recurrent_cache.prune_stranded()
         self.pagetable.defrag()
-        # Dynamic expert placement: apply any pending swap sweep now, between generations —
-        # a placement change perturbs the logits slightly (same expert, different device
-        # numerics) and must never land mid-stream
+        # Dynamic expert placement: apply any pending swap sweep now, with the full budget (iterate()
+        # runs small sweeps mid-stream; a placement change perturbs the logits only slightly, the same
+        # expert computed with different device numerics)
         from ..modules.block_sparse_mlp_cpu import run_pending_swap_sweeps
         run_pending_swap_sweeps(self.model.config.infer_params)
         malloc_trim()
@@ -769,6 +813,20 @@ class Generator:
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
+
+        # Gumbel-coupled drafting (EXL3_MTP_COUPLED, default on): a single job whose verification window is
+        # presampled draws the round's noise seed now, and the MTP samples every draft position with the job's own
+        # sampler and the noise the target will use at that position (Job.coupled_seed). The target's samples are
+        # untouched, so the output distribution is exact; the draft just agrees with them far more often under
+        # temperature sampling than a greedy draft does
+        couple = None
+        if _mtp_coupled and batch_size == 1 and cal is None:
+            couple = next(job for job in self.active_jobs if job.is_prefill_done())
+            if couple.can_presample_window():
+                couple.coupled_base = couple.rng.randint(0, (1<<32) - 1)
+            else:
+                couple = None
+
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -779,6 +837,8 @@ class Generator:
             }
             if cal is not None:
                 params["export_draft_conf"] = True
+            if couple is not None:
+                params["draft_sample"] = lambda logits, i = idx: couple.coupled_sample(logits, i)
             batch_state = self.draft_model.forward(batch_ids, params)
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
@@ -805,6 +865,31 @@ class Generator:
             }
 
         return self.draft_ids_pinned[:, :window]
+
+
+    def iterate_mtp_lookup(self):
+        """
+        Prompt-lookup draft for an MTP generator (see mtp_lookup_min): the continuation of the longest earlier
+        occurrence of the current suffix, when it is longer than the MTP window. Single-sequence batches only.
+        Records the MTP carry state, since the MTP layer does not run this round and its K/V for the accepted
+        positions must be written after verification.
+        """
+        self._lookup_round = None
+        jobs = [job for job in self.active_jobs if job.is_prefill_done()]
+        if len(jobs) != 1 or len(jobs[0].sequences) != 1:
+            return None
+        job = jobs[0]
+        if job.mtp_last_hidden is None or job.sam is None:
+            return None
+        draft = job.get_ngram_draft(self.mtp_lookup_max, max(self.lookup_thresh, self.mtp_lookup_min))
+        if draft.shape[-1] < self.mtp_lookup_minlen:
+            return None
+        self._draft_conf_round = None
+        self._lookup_round = job.mtp_last_hidden
+        self._lookup_len = draft.shape[-1]
+        self.lookup_stats[0] += 1
+        self.lookup_stats[1] += draft.shape[-1]
+        return draft
 
 
     # TODO: Refactor, share code with other draft fns
@@ -1357,9 +1442,31 @@ class Generator:
                 if id(job) in rewound_jobs:
                     continue
 
+                # A prompt-lookup round never ran the MTP layer: write its K/V for every accepted position
+                # K..K+A-1, the first paired with the carry state the MTP would have drafted from
+                if self._lookup_round is not None:
+                    self.lookup_stats[2] += accepted_length - 1
+                    if accepted_length - 1 >= self._lookup_len:
+                        self.lookup_thresh = max(self.mtp_lookup_min, self.lookup_thresh - 1)
+                    elif 2 * (accepted_length - 1) < self._lookup_len:
+                        self.lookup_thresh = min(64, self.lookup_thresh + 2)
+                    self.draft_model.prefill(
+                        batch_ids[a_idx:b_idx, :accepted_length],
+                        {
+                            "attn_mode": "flash_attn",
+                            "block_table": block_index[a_idx:b_idx],
+                            "cache": self.draft_cache,
+                            "cache_seqlens": p_cache_seqlens[a_idx:b_idx],
+                            "target_hidden": torch.cat(
+                                (self._lookup_round, target_hidden[a_idx:b_idx, :accepted_length - 1, :]),
+                                dim = 1,
+                            ),
+                        },
+                    )
+
                 # Position K was drafted from the last target state already. Replace accepted
                 # speculative positions K+1..K+A-1 with the corresponding target-state inputs.
-                if accepted_length > 1:
+                elif accepted_length > 1:
                     self.draft_model.prefill(
                         batch_ids[a_idx:b_idx, 1:accepted_length],
                         {

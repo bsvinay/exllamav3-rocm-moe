@@ -49,10 +49,10 @@ cpu_unload. The worker process itself lives in model/moe_cpu_host.py.
 
 
 @torch.inference_mode()
-def run_pending_swap_sweeps(infer_params):
+def run_pending_swap_sweeps(infer_params, budget = None, learn = True):
     """Run any pending dynamic-placement sweep (see BlockSparseMLP._split_swap_tick). Called
-    by the generator when its job queue drains, so placement only ever changes between
-    generations; safe no-op otherwise. The sweep updates the placement map, the hit
+    by the generator when its job queue drains (full budget, placement persisted) and between
+    two forward passes of a long generation (small budget, learn = False); safe no-op otherwise. The sweep updates the placement map, the hit
     histogram and the arena slots in place, and those are inference tensors (allocated under
     inference mode at load), so it must itself run under inference mode: the generator's
     cancel() and clear_queue() paths reach here outside any forward (issue #329)."""
@@ -75,11 +75,14 @@ def run_pending_swap_sweeps(infer_params):
         for h in {m.cpu_host for m in reg}:
             assert int(h.v_jobs_head[0]) == int(h.v_jobs_tail[0]), \
                 "swap sweep: job ring not drained after all-device sync"
-    _learn_placement(reg)
+    # Mid-stream sweeps (learn = False) leave the persisted placement to the next between-generations sweep
+    if learn:
+        _learn_placement(reg)
     # Budget per sweep, spread evenly over the layers (first-come let the early layers take it all)
     import time
     t0 = time.perf_counter()
-    budget = int(os.environ.get("EXL3_MOE_CPU_SWAP_MAX", 384))
+    if budget is None:
+        budget = int(os.environ.get("EXL3_MOE_CPU_SWAP_MAX", 384))
     per_layer = max(1, -(-budget // len(reg)))
     total = 0
     for m in reg:
@@ -126,7 +129,7 @@ def _learn_placement(reg):
         path = os.path.join(reg[0].config.directory, "expert_stats_learned.json")
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({k: [int(round(float(x) * 1e8)) for x in v] for k, v in _learned.items()}, f)
+            json.dump({k: (v * 1e8).round().long().tolist() for k, v in _learned.items()}, f)
         os.replace(tmp, path)
     except OSError:
         pass
@@ -681,8 +684,10 @@ class BlockSparseMLP_CPU:
         # floor, so sweeps become no-ops
         floor = float(os.environ.get("EXL3_MOE_CPU_SWAP_FLOOR", 2.0 if fast else 8.0)) \
             * float(hist.sum()) / self.num_experts
-        head = [(float(hist[r]), r) for r in range(self.num_experts) if int(mp[r]) < first]
-        tail = [(float(hist[r]), r) for r in range(self.num_experts) if int(mp[r]) >= first]
+        mp_l = mp.tolist()
+        hist_l = hist.tolist()
+        head = [(hist_l[r], r) for r in range(self.num_experts) if mp_l[r] < first]
+        tail = [(hist_l[r], r) for r in range(self.num_experts) if mp_l[r] >= first]
         head.sort()
         tail.sort(reverse = True)
         nswaps = 0
@@ -730,7 +735,7 @@ class BlockSparseMLP_CPU:
         ci, off = host.layer_blocks[li][local]
         arena = host.arena_views[ci][off // 2 : (off + exp_b) // 2]
         dev = dst[0].trellis.device
-        hot = arena.to(dev)                                   # H2D from the registered arena
+        hot = arena.to(dev, non_blocking = True)              # H2D from the registered arena, stream-ordered
         cold_blk = torch.empty(exp_b // 2, dtype = torch.int16, device = dev)
         cold_aux = []
         pos = 0

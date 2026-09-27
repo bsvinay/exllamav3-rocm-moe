@@ -617,11 +617,29 @@ class Job:
         )
 
 
+    def coupled_seed(self, i: int) -> int:
+        """Noise seed of position i of a Gumbel-coupled verification window (see iterate_draftmodel_mtp_gen)"""
+        return (self.coupled_base + (i + 1) * 0x9E3779B1) & 0xFFFFFFFF
+
+
+    def coupled_sample(self, logits: torch.Tensor, i: int) -> torch.Tensor:
+        """Draft sample for position i of a coupled window: the job's sampler with that position's noise"""
+        return self.sampler.forward(logits, None, self.coupled_seed(i), self.generator.tokenizer)
+
+
     def presample_window(self, logits: torch.Tensor) -> torch.Tensor:
         """
         Launch sampling of every position of a verification window, logits (1, n, vocab); returns the (1, n)
-        samples on the logits device. Only valid when can_presample_window()
+        samples on the logits device. Only valid when can_presample_window(). A coupled window samples each
+        position with its own seed, the one its draft token was sampled with
         """
+        if getattr(self, "coupled_base", None) is not None:
+            out = torch.cat([
+                self.sampler.forward(logits[:, i:i + 1, :], None, self.coupled_seed(i), self.generator.tokenizer)
+                for i in range(logits.shape[1])
+            ], dim = 1)
+            self.coupled_base = None
+            return out
         return self.sampler.forward(
             logits,
             None,
@@ -664,7 +682,7 @@ class Job:
 
         # Accept token
         self.new_tokens += 1
-        requeue_now = self.new_tokens > self.max_rq_tokens - self.generator.num_draft_tokens
+        requeue_now = self.new_tokens > self.max_rq_tokens - self.generator.draft_headroom
 
         for seq in self.sequences:
 
@@ -1139,7 +1157,7 @@ class Job:
         # requeue budget's headroom below so that budget still fits the cache exactly
         if self.max_new_tokens is None:
             self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids)
-                                      - 1 - self.generator.num_draft_tokens)
+                                      - 1 - self.generator.draft_headroom)
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
@@ -1151,7 +1169,7 @@ class Job:
                 self.max_rq_tokens = y - x
         else:
             # Default budget: the whole response plus one speculative window past the limit
-            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.num_draft_tokens
+            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.draft_headroom
 
         # Compatibility checks
         if self.banned_strings and self.generator.recurrent_cache is not None:
@@ -1204,7 +1222,7 @@ class Job:
             self.held_probs = SeqTensor((1, 0), dtype = torch.float, seq_dim = -1)
             self.held_logits = SeqTensor((1, 0, self.generator.padded_vocab_size), dtype = torch.float, seq_dim = 1)
             self.full_completion = ""
-            self.sam = None if not generator.ngram_match_min else ext.BC_SAM()
+            self.sam = None if not (generator.ngram_match_min or generator.mtp_lookup_min) else ext.BC_SAM()
 
         self.time_enqueue = time.time()
 
@@ -1674,7 +1692,7 @@ class Job:
             self.recurrent_state = None
 
 
-    def get_ngram_draft(self, draft_length: int):
+    def get_ngram_draft(self, draft_length: int, match_min: int | None = None):
         """
         Return speculative draft tokens from the suffix-array n-gram matcher.
         """
@@ -1685,7 +1703,7 @@ class Job:
         beg, end = self.sam.accept_tensor(seq)
 
         # Grab continuation after longest match or return empty seq
-        if end - beg >= self.generator.ngram_match_min:
+        if end - beg >= (match_min or self.generator.ngram_match_min):
             draft = seq[:, end : end + draft_length]
         else:
             draft = torch.empty((1, 0), dtype = torch.long)
