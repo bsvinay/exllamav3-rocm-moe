@@ -28,6 +28,15 @@ single stream:
 | exllamav3 generator (`rocm_tests/moe_gen.py`), general-purpose placement | 46 tok/s code and prose |
 | llama.cpp, same GPU, IQ4_XS GGUF, `--n-cpu-moe 36` (reference) | 17.5 tok/s |
 
+4.05 bpw (branch `4.05bpw_h6_ng6`: 4-bit experts, 6-bit attention / GDN / shared expert, 101 GB) on the same box:
+388 of 512 experts per layer on the CPU (124 on the GPU, 22.1 GB VRAM), ~53 GB of RAM for the CPU experts
+(~7.5 GB left for the page cache), MTP 2 tokens, 128K Q8:
+
+| | decode |
+|---|---|
+| TabbyAPI, MTP, learned placement | **68 tok/s** code, 42 tok/s prose (60 / 37 on the first request) |
+| exllamav3 generator | 62 tok/s code, 45 tok/s prose |
+
 Decode step, by the numbers (`rocm_tests/prof_step.py`, one token):
 
 | stage | before | now |
