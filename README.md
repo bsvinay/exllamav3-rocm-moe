@@ -94,8 +94,18 @@ draft_model:
   draft_cache_mode: Q8
 ```
 
-Run TabbyAPI with `EXL3_NOGRAPH=mlp,gdn,moe`. Memory at this setting: 21.9 GB VRAM, ~33 GB RAM for the CPU
-experts, the rest of RAM as page cache for the n-gram table.
+Run TabbyAPI with `EXL3_NOGRAPH=mlp,gdn,moe,attn` (MoE models need `moe`: the CPU-offloaded expert path cannot run
+inside a HIP graph, and loading fails with `Graph update failed` in `run_single_expert` otherwise; eager `attn` costs
+nothing at decode and avoided a rare graph-replay crash under agent load). `rocm/scripts/run_tabbyapi.sh` defaults to
+`mlp,gdn`, which is for the dense models. Memory at this setting: 21.9 GB VRAM, ~33 GB RAM for the CPU experts, the
+rest of RAM as page cache for the n-gram table.
+
+Host memory: every prefill stashes recurrent checkpoints (~3 MB per GDN layer each) that are freed again on eviction.
+On glibc's brk heap those freed chunks stayed resident, so the server's anonymous RSS grew by ~0.3-0.5 GB per
+32K-token prompt and never came back (issue #1). The generator now serves allocations of 1 MiB and more from their own
+mappings (`mallopt(M_MMAP_THRESHOLD)`, `EXL3_MMAP_THRESHOLD`, 0 disables), which returns them to the OS on free:
+measured on a 30-turn agent session growing from 30K to 66K tokens, RSS rises by the recurrent-cache budget
+(`sysmem_recurrent_cache`) and then stays flat.
 
 ## What the MoE work changed
 
@@ -391,7 +401,8 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_GDN_REG` | 1 | 0 = original DeltaNet recurrence kernel (state re-read from memory per token) |
 | `EXL3_FUSE_NORM_HAD` | 1 | 0 = no matmul input transform in the RMSNorm tail |
 | `EXL3_RESID_DEFER` | 1 | 0 = no residual-add folding into the next block's input norm |
-| `EXL3_NOGRAPH` | - (`mlp,gdn` in `run_tabbyapi.sh`) | modules (`mlp`, `gdn`, `attn`) that decode eagerly instead of through a HIP graph |
+| `EXL3_NOGRAPH` | - (`mlp,gdn` in `run_tabbyapi.sh`) | modules (`mlp`, `gdn`, `moe`, `attn`) that decode eagerly instead of through a HIP graph; MoE models with CPU experts need `moe` |
+| `EXL3_MMAP_THRESHOLD` | 1048576 | host allocations of at least this many bytes get their own mapping (returned to the OS on free); 0 = glibc default |
 | `EXL3_PF_BLOCK_M`, `EXL3_PF_BLOCK_N`, `EXL3_PF_WARPS` | - | Triton prefill tile overrides |
 
 ## Tests and benchmarks (`rocm_tests/`)

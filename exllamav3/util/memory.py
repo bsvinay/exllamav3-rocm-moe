@@ -95,6 +95,37 @@ def malloc_trim():
         _libc = False
 
 
+_mmap_threshold_set = False
+
+def large_allocs_mmap():
+    """
+    Serve host allocations of 1 MiB and more from their own mappings (glibc M_MMAP_THRESHOLD), so freeing them
+    returns the memory to the OS. Recurrent checkpoints are stashed as ~3 MB tensors per layer, created during
+    every prefill and freed as they are evicted; on the brk heap those chunks stayed resident after being freed
+    (malloc_trim could not release them), so RSS grew with every prefilled prompt (~0.3-0.5 GiB per 32K-token
+    prompt, issue #1). EXL3_MMAP_THRESHOLD overrides the threshold in bytes (0: leave glibc alone); an explicit
+    MALLOC_MMAP_THRESHOLD_ in the environment is respected.
+    """
+    global _mmap_threshold_set, _libc
+    if _mmap_threshold_set or not sys.platform.startswith("linux"):
+        return
+    _mmap_threshold_set = True
+    import os
+    if "MALLOC_MMAP_THRESHOLD_" in os.environ:
+        return
+    threshold = int(os.environ.get("EXL3_MMAP_THRESHOLD", 1 << 20))
+    if threshold <= 0:
+        return
+    try:
+        import ctypes
+        if not _libc:
+            _libc = ctypes.CDLL("libc.so.6")
+        M_MMAP_THRESHOLD = -3
+        _libc.mallopt(M_MMAP_THRESHOLD, threshold)
+    except Exception:
+        pass
+
+
 def list_gpu_tensors(min_size: int = 1, cuda_only: bool = True):
     """
     Search the current process for referenced CUDA tensors and list them.

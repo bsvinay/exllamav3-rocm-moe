@@ -7,6 +7,6 @@ CONFIG=${1:-config.yml}
 TABBY=${2:-$REPO/../tabbyAPI}
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}   # skip an integrated GPU
-export EXL3_NOGRAPH=${EXL3_NOGRAPH-mlp,gdn}             # eager MLP / DeltaNet decode: ~0.5% faster than graphs
+export EXL3_NOGRAPH=${EXL3_NOGRAPH-mlp,gdn}             # eager MLP / DeltaNet decode: ~0.5% faster than graphs (dense models; MoE: mlp,gdn,moe,attn)
 cd "$TABBY"
 exec python main.py --config "$CONFIG"

@@ -9,7 +9,7 @@ from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
 
 logger = logging.getLogger(__name__)
-from ..util.memory import malloc_trim
+from ..util.memory import malloc_trim, large_allocs_mmap
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
@@ -141,6 +141,8 @@ class Generator:
 
         :param kwargs:
         """
+        large_allocs_mmap()
+
 
         self.model = model
         self.cache = cache
