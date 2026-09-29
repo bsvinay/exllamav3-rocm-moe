@@ -18,6 +18,10 @@ _presample_enable = os.environ.get("EXL3_PRESAMPLE", "1") != "0"
 _adapt_window_enable = os.environ.get("EXL3_ADAPT_WINDOW", "0") == "1"   # off: +4% prose, -3% code
 _swap_midstream = os.environ.get("EXL3_MOE_CPU_SWAP_MIDSTREAM", "1") != "0"
 _mtp_coupled = os.environ.get("EXL3_MTP_COUPLED", "1") != "0"
+# Stall watchdog: a single iterate() that runs longer than this many seconds dumps every thread's stack to stderr and
+# ends the process (a supervisor restarts it). A hung GPU <-> CPU-expert handoff otherwise leaves the server spinning
+# in a device synchronize forever while its health endpoint still reports healthy. 0 disables
+_watchdog_s = float(os.environ.get("EXL3_WATCHDOG_S", 300))
 from .adaptive_window import AdaptiveWindow
 _draft_nb_enable = os.environ.get("EXL3_DRAFT_NB", "1") != "0"
 from .job import Job
@@ -142,6 +146,10 @@ class Generator:
         :param kwargs:
         """
         large_allocs_mmap()
+        self._iter_t0 = None
+        if _watchdog_s > 0:
+            import threading
+            threading.Thread(target = self._watchdog, name = "exl3-watchdog", daemon = True).start()
 
 
         self.model = model
@@ -480,6 +488,14 @@ class Generator:
 
     @torch.inference_mode
     def iterate(self) -> list[dict]:
+        self._iter_t0 = time.time()
+        try:
+            return self._iterate()
+        finally:
+            self._iter_t0 = None
+
+
+    def _iterate(self) -> list[dict]:
         """
         Performs inference on available jobs.
 
@@ -618,6 +634,19 @@ class Generator:
 
         # Finished iteration
         return results
+
+
+    def _watchdog(self):
+        import faulthandler, sys, time as _time
+        while True:
+            _time.sleep(min(30.0, _watchdog_s / 4))
+            t0 = self._iter_t0
+            if t0 is not None and _time.time() - t0 > _watchdog_s:
+                print(f" !! exllamav3 watchdog: one generator iteration has run for {_time.time() - t0:.0f} s "
+                      f"(EXL3_WATCHDOG_S={_watchdog_s:.0f}); dumping stacks and exiting", file = sys.stderr, flush = True)
+                faulthandler.dump_traceback(file = sys.stderr, all_threads = True)
+                sys.stderr.flush()
+                os._exit(70)
 
 
     @torch.inference_mode()

@@ -45,9 +45,44 @@ like the dense profile):
 | 192K context: GPU experts per layer / VRAM | 156 / 22.0 GB | 116 / 22.3 GB |
 | decode, code / prose (after the first request) | 81 / 56 tok/s | 65 / 44 tok/s |
 | 262K (native maximum) | fits with fewer GPU experts | fits at 106 GPU experts / 22.3 GB |
-| vision | not in the 3.05 branch | yes (`vision_k6`), `vision_offload: true` keeps the tower in pinned RAM, ~2 s per image request |
+| vision | yes: 5-bit tower inside `model-00007-of-00007.safetensors` (`vision_bits: 5`) | yes: 6-bit tower in `vision_k6.safetensors` |
+
+Both branches carry the vision tower (an earlier version of this README said the 3.05 branch had none; it only
+lacks the separate `vision_k6` file). With `vision: true` and `vision_offload: true` the tower stays in pinned RAM
+and costs no expert slots.
 
 A Q4 cache for the MTP layer saves almost nothing (one attention layer) and did not help acceptance.
+
+### Current serving profile (2026-09-29)
+
+3.05 bpw, 192K context, Q8 KV cache, 360 of 512 experts per layer on the CPU (152 on the GPU), MTP 2 tokens with
+Gumbel-coupled drafts and prompt lookup, vision on with `vision_offload`, TabbyAPI:
+
+| | |
+|---|---|
+| VRAM / RAM after load | 24.8 GB / 32.5 GB of pinned CPU experts, ~23 GB of the 60 GB still available |
+| code edit through the API (1.4K-token prompt, 1.4K tokens out, first request after load) | **84.5 tok/s**, 99% of drafts accepted (prompt lookup, ~5 tokens per round) |
+| agent session at 44-49K context (tool calls, thinking) | 48-71 tok/s, 55-83% of drafts accepted |
+| a 30-turn session growing from 30K to 66K tokens | 3-4 s per turn; host RSS flat after the recurrent-cache budget |
+
+**Which variant.** 3.05 bpw is the one to run on a 60-64 GB machine: 4.05 bpw pins ~48 GB of experts and leaves
+~7 GB of RAM, which long agent sessions exhausted (the box thrashed until it froze, before the heap fix below and
+with only 8 GB of swap). Quality is close (next section), and 3.05 is ~25% faster.
+
+### Capability: Flash-Next 3.05 bpw vs the dense 27B
+
+Same harness for both (`rocm_tests/iqbench.py`, through the TabbyAPI endpoint, thinking on, temperature 0.6 /
+top-p 0.95 / top-k 20, one fixed seed per question, a 10K-token budget per answer counted as wrong when hit):
+
+| | Qwen3.8-Flash-Next 3.05 bpw | Qwen3.8-27B 3.5 bpw (heretic) |
+|---|---|---|
+| MMLU-Pro, 80 random questions (10 options) | **90.0%** | 87.5% |
+| MATH-500, 30 level-4/5 problems | **93.3%** | 90.0% |
+| HumanEval, first 60 problems (executed tests) | 93.3% | **95.0%** |
+
+Paired per question: of 170, 152 are right for both, 4 only for Flash-Next and 2 only for the dense model. A tie
+within noise; Flash-Next thinks ~20% longer on MMLU-Pro. Flash-Next is the faster of the two on this box with a
+192K context; the dense model fits entirely in VRAM and has the shorter prefill.
 
 Decode step, by the numbers (`rocm_tests/prof_step.py`, one token):
 
@@ -77,22 +112,42 @@ EXL3_NOGRAPH=mlp,gdn,moe python rocm_tests/moe_gen.py -m models/Qwen3.8-Flash-Ne
     --mcs 346 --mct 12 --cache 131072 --kv_bits 8
 ```
 
-TabbyAPI (`config.yml`, model section):
+TabbyAPI (`config.yml`), the profile above:
 
 ```yaml
 model:
   model_name: Qwen3.8-Flash-Next-exl3-3.05bpw
-  max_seq_len: 131072
-  cache_size: 131072
+  max_seq_len: 196608
+  cache_size: 196608
   cache_mode: Q8
-  cpu_moe_split_experts: 362   # experts per layer on the CPU (346 without MTP)
+  chunk_size: 2048
+  cpu_moe_split_experts: 360   # experts per layer on the CPU; 356 without prompt lookup, 346 with 128K and no MTP
   cpu_moe_threads: 12
-  vision: false                # the 3.05bpw branch ships no vision tower
+  vision: true                 # the 3.05 branch has a 5-bit tower
+  vision_offload: true         # keep the tower in pinned RAM
 draft_model:
   draft_mode: mtp              # the model's own MTP layer; "disabled" for plain decoding
   draft_num_tokens: 2
   draft_cache_mode: Q8
+memory:
+  sysmem_recurrent_cache: 2048
+sampling:
+  override_preset: flashnext_defaults   # see below
 ```
+
+Sampling defaults matter. Many agents send no `temperature` / `top_k` / `top_p`, and TabbyAPI's own defaults then
+sample temperature 1.0 over the full 248K vocabulary. Over a few thousand tokens of thinking that drifts into word
+salad. Set the model's `generation_config.json` values as non-forced defaults in a sampler preset
+(`sampler_overrides/flashnext_defaults.yml`):
+
+```yaml
+temperature: {override: 1.0, force: false}
+top_k: {override: 20, force: false}
+top_p: {override: 0.95, force: false}
+```
+
+Environment for the prompt-lookup drafts (`max_history` must cover the lookup window, see below):
+`EXL3_MTP_LOOKUP=4 EXL3_MTP_LOOKUP_MAX=4`.
 
 Run TabbyAPI with `EXL3_NOGRAPH=mlp,gdn,moe,attn` (MoE models need `moe`: the CPU-offloaded expert path cannot run
 inside a HIP graph, and loading fails with `Graph update failed` in `run_single_expert` otherwise; eager `attn` costs
@@ -106,6 +161,12 @@ On glibc's brk heap those freed chunks stayed resident, so the server's anonymou
 mappings (`mallopt(M_MMAP_THRESHOLD)`, `EXL3_MMAP_THRESHOLD`, 0 disables), which returns them to the OS on free:
 measured on a 30-turn agent session growing from 30K to 66K tokens, RSS rises by the recurrent-cache budget
 (`sysmem_recurrent_cache`) and then stays flat.
+
+Stall watchdog: once, a request never finished. The server spun in a device synchronize and the CPU expert worker
+waited for work, while `/health` still answered. A generator iteration that runs longer than `EXL3_WATCHDOG_S`
+(default 300 s; a normal one takes milliseconds to a few seconds) now dumps every thread's stack to stderr and
+exits the process, so a supervisor (systemd `Restart=always`) brings it back. The request fails instead of hanging
+forever, and the stack dump shows where it stopped.
 
 ## What the MoE work changed
 
@@ -402,6 +463,10 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_FUSE_NORM_HAD` | 1 | 0 = no matmul input transform in the RMSNorm tail |
 | `EXL3_RESID_DEFER` | 1 | 0 = no residual-add folding into the next block's input norm |
 | `EXL3_NOGRAPH` | - (`mlp,gdn` in `run_tabbyapi.sh`) | modules (`mlp`, `gdn`, `moe`, `attn`) that decode eagerly instead of through a HIP graph; MoE models with CPU experts need `moe` |
+| `EXL3_WATCHDOG_S` | 300 | a generator iteration running longer than this dumps all stacks and exits the process (0 = off) |
+| `EXL3_MTP_LOOKUP`, `EXL3_MTP_LOOKUP_MAX` | 0, 5 | prompt lookup beside MTP drafting: minimum suffix match (0 = off) and draft length |
+| `EXL3_MTP_COUPLED` | 1 | Gumbel-coupled MTP drafts under sampling (0 = greedy drafts) |
+| `EXL3_MOE_CPU_SWAP_MIDSTREAM_MAX` | 96 | expert swaps per sweep between forward passes of a long generation (`EXL3_MOE_CPU_SWAP_MIDSTREAM=0`: only between generations) |
 | `EXL3_MMAP_THRESHOLD` | 1048576 | host allocations of at least this many bytes get their own mapping (returned to the OS on free); 0 = glibc default |
 | `EXL3_PF_BLOCK_M`, `EXL3_PF_BLOCK_N`, `EXL3_PF_WARPS` | - | Triton prefill tile overrides |
 
@@ -427,6 +492,7 @@ verification from ~45 ms to ~14 ms per round.
 | `gen_check.py -m <model> [--mtp] [--task edit] [--temp T]`, `gen_check_mt.py` | generation fidelity at long context: generated tokens vs the argmax of a chunked-prefill reference, per window (flat ~0.975 greedy when healthy); `_mt`: multi-turn with recurrent-state restore |
 | `speed_ab.py -m <model> [--task edit] [--seeds 1,2,3]` | paired decode-speed A/B of Gumbel coupling and prompt lookup in one process |
 | `dist_check.py -m <model>` | token-distribution check of coupled vs uncoupled speculative sampling |
+| `iqbench_data.py`, `iqbench.py <url> <name>` | capability benchmark through an OpenAI endpoint: MMLU-Pro, MATH-500 level 4-5, HumanEval (executed), thinking on, resumable |
 
 Model paths default to `models/...` or `EXL3_MODEL_DIR` / `EXL3_DRAFT_DIR`. Greedy speculative decoding
 produces the same text as plain decoding for the DFlash2 path in these tests.
