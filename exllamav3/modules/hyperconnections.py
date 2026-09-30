@@ -13,6 +13,39 @@ import math
 # Prefill-sized GatedResidual mixes run the tiled deterministic kernel (rank-consistent under
 # TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
 _gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
+_gr_gate_fused_enable = os.environ.get("EXL3_GR_GATE_FUSED", "1") != "0"
+
+_gr_gate_kernel = None
+
+def _gr_gate_mean(g: torch.Tensor, normed: torch.Tensor, norm_w: torch.Tensor | None, H: int, Dh: int) -> torch.Tensor:
+    """mixed[r, d] = mean_h(sigmoid(g[r, h, d]) * normed[r, h, d] * norm_w[h, d]) as half, in one pass over the half
+    inputs (the GEMM path's gate + stream mean for prefill-sized row counts; the torch form ran ~6 fp32 passes).
+    g: (R, H * Dh) half, normed: (R * H, Dh) half, norm_w: (H, Dh) float or None."""
+    global _gr_gate_kernel
+    import triton
+    import triton.language as tl
+    if _gr_gate_kernel is None:
+        @triton.jit
+        def _k(g, n, w, out, R, Dh: tl.constexpr, H: tl.constexpr, HAS_W: tl.constexpr, BLOCK: tl.constexpr):
+            r = tl.program_id(0)
+            offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+            m = offs < Dh
+            acc = tl.zeros((BLOCK,), dtype = tl.float32)
+            for h in tl.static_range(H):
+                gv = tl.load(g + (r * H + h) * Dh + offs, mask = m, other = 0.0).to(tl.float32)
+                nv = tl.load(n + (r * H + h) * Dh + offs, mask = m, other = 0.0).to(tl.float32)
+                if HAS_W:
+                    nv = nv * tl.load(w + h * Dh + offs, mask = m, other = 0.0)
+                acc += tl.sigmoid(gv) * nv
+            tl.store(out + r * Dh + offs, (acc / H).to(tl.float16), mask = m)
+        _gr_gate_kernel = _k
+    R = g.shape[0]
+    out = torch.empty((R, Dh), dtype = torch.half, device = g.device)
+    BLOCK = 512
+    wt = norm_w.float().contiguous() if norm_w is not None else g
+    _gr_gate_kernel[(R, triton.cdiv(Dh, BLOCK))](
+        g.contiguous(), normed.contiguous(), wt, out, R, Dh, H, norm_w is not None, BLOCK, num_warps = 4)
+    return out
 
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
@@ -457,8 +490,11 @@ class GatedResidual(Module):
                 post.copy_(2.0 * torch.sigmoid(dm[:, self.rank :].float() / H))
             up = self.upx_h.permute(0, 1, 3, 2).reshape(H * Dh, self.rank)
             g = torch.matmul(t, up.t())                                             # (R, H * Dh)
-            mixed = (torch.sigmoid(g.float()).view(R, H, Dh)
-                     * (normed.float().view(R, H, Dh) * self.norm_w)).mean(dim = -2).half()
+            if _gr_gate_fused_enable and g.is_cuda:
+                mixed = _gr_gate_mean(g, normed, self.norm_w.view(H, Dh), H, Dh)
+            else:
+                mixed = (torch.sigmoid(g.float()).view(R, H, Dh)
+                         * (normed.float().view(R, H, Dh) * self.norm_w)).mean(dim = -2).half()
         else:
             self._require_source_weights("the cuBLAS path")
             post = torch.empty((R, H), dtype = torch.float, device = dev) \
@@ -471,8 +507,11 @@ class GatedResidual(Module):
             if self.use_combine:
                 post.copy_(2.0 * torch.sigmoid(dm[:, self.rank :].float() / H))
             g = torch.matmul(t, self.up_h.t())                             # (R, H * Dh)
-            mixed = (torch.sigmoid(g.float()).view(R, H, Dh)
-                     * normed.float().view(R, H, Dh)).mean(dim = -2).half()
+            if _gr_gate_fused_enable and g.is_cuda:
+                mixed = _gr_gate_mean(g, normed, None, H, Dh)
+            else:
+                mixed = (torch.sigmoid(g.float()).view(R, H, Dh)
+                         * normed.float().view(R, H, Dh)).mean(dim = -2).half()
         return post, mixed
 
     def mix(self, streams: torch.Tensor, params: dict):
