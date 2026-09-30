@@ -55,13 +55,15 @@ A Q4 cache for the MTP layer saves almost nothing (one attention layer) and did 
 
 ### Current serving profile (2026-09-29)
 
-3.05 bpw, 192K context, Q8 KV cache, 360 of 512 experts per layer on the CPU (152 on the GPU), MTP 2 tokens with
-Gumbel-coupled drafts and prompt lookup, vision on with `vision_offload`, TabbyAPI:
+3.05 bpw, 192K context, Q8 KV cache, 8192-token prefill chunks, 380 of 512 experts per layer on the CPU (132 on the
+GPU), MTP 2 tokens with Gumbel-coupled drafts and prompt lookup, vision on with `vision_offload`, TabbyAPI:
 
 | | |
 |---|---|
-| VRAM / RAM after load | 24.8 GB / 32.5 GB of pinned CPU experts, ~23 GB of the 60 GB still available |
-| code edit through the API (1.4K-token prompt, 1.4K tokens out, first request after load) | **84.5 tok/s**, 99% of drafts accepted (prompt lookup, ~5 tokens per round) |
+| VRAM / RAM after load | 25.0 GB / ~34 GB of pinned CPU experts, ~21 GB of the 60 GB still available |
+| prefill, fresh 27.8K / 62.7K-token prompt (warm page cache) | **~1,120 / 1,010 tok/s** (was ~500-600 with 2048-token chunks) |
+| prose, 600-word story, sampled | 45-50 tok/s once placement has adapted (36 on the first prose request after load) |
+| code edit through the API (1.4K-token prompt, 1.4K tokens out) | **80-84 tok/s**, 99% of drafts accepted (prompt lookup, ~5 tokens per round) |
 | agent session at 44-49K context (tool calls, thinking) | 48-71 tok/s, 55-83% of drafts accepted |
 | a 30-turn session growing from 30K to 66K tokens | 3-4 s per turn; host RSS flat after the recurrent-cache budget |
 
@@ -120,8 +122,8 @@ model:
   max_seq_len: 196608
   cache_size: 196608
   cache_mode: Q8
-  chunk_size: 2048
-  cpu_moe_split_experts: 360   # experts per layer on the CPU; 356 without prompt lookup, 346 with 128K and no MTP
+  chunk_size: 8192             # prefill ~2x faster than 2048; its buffers need ~20 more CPU experts per layer
+  cpu_moe_split_experts: 380   # experts per layer on the CPU; 360 with chunk_size 2048, 346 with 128K and no MTP
   cpu_moe_threads: 12
   vision: true                 # the 3.05 branch has a 5-bit tower
   vision_offload: true         # keep the tower in pinned RAM
@@ -154,6 +156,23 @@ inside a HIP graph, and loading fails with `Graph update failed` in `run_single_
 nothing at decode and avoided a rare graph-replay crash under agent load). `rocm/scripts/run_tabbyapi.sh` defaults to
 `mlp,gdn`, which is for the dense models. Memory at this setting: 21.9 GB VRAM, ~33 GB RAM for the CPU experts, the
 rest of RAM as page cache for the n-gram table.
+
+Prefill (`rocm_tests/prof_prefill.py`, 3.05 bpw, per chunk after 8K of context):
+
+| chunk | time | tok/s | MoE (expert streaming) | PLE (n-gram rows) | GDN | attention |
+|---|---|---|---|---|---|---|
+| 2048 | 3.4 s | 600 | 2.2 s | 0.51 s | 0.25 s | 0.23 s |
+| 8192 | 8.7 s | 945 | 3.7 s | 1.80 s | 1.36 s | 0.89 s |
+
+The CPU-resident experts cross PCIe once per chunk however many tokens it holds, so larger chunks amortize them
+(the lever [Strata](https://github.com/Niko1221/Strata) measured on the same GPU). The n-gram rows of a chunk are
+gathered from the page cache / SSD on the host (~0.22 ms per token), and the PLE layer sits at the front of the
+forward pass, so the GPU used to wait for them. The generator now predicts the next prefill chunk with the same
+chunking rules and the PLE layer stages its rows on the worker thread while the current chunk runs
+(`EXL3_NGRAM_PREFETCH_NEXT`, default on; a wrong prediction only costs the staging work): 2048-token chunks
+600 -> 680 tok/s, 8192-token chunks with it ~990 tok/s (16K prompt, `rocm_tests/prefill_bench.py`). Generation
+after an 8192-chunk prefill agrees with a 2048-chunk reference at 96.4%, flat over 2K generated tokens (97.5% with
+the same chunking): the rounding of the different chunking, not a drift.
 
 Host memory: every prefill stashes recurrent checkpoints (~3 MB per GDN layer each) that are freed again on eviction.
 On glibc's brk heap those freed chunks stayed resident, so the server's anonymous RSS grew by ~0.3-0.5 GB per
@@ -465,6 +484,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_NOGRAPH` | - (`mlp,gdn` in `run_tabbyapi.sh`) | modules (`mlp`, `gdn`, `moe`, `attn`) that decode eagerly instead of through a HIP graph; MoE models with CPU experts need `moe` |
 | `EXL3_WATCHDOG_S` | 300 | a generator iteration running longer than this dumps all stacks and exits the process (0 = off) |
 | `EXL3_MTP_LOOKUP`, `EXL3_MTP_LOOKUP_MAX` | 0, 5 | prompt lookup beside MTP drafting: minimum suffix match (0 = off) and draft length |
+| `EXL3_NGRAM_PREFETCH_NEXT` | 1 | stage the next prefill chunk's n-gram rows while the current chunk runs |
 | `EXL3_MTP_COUPLED` | 1 | Gumbel-coupled MTP drafts under sampling (0 = greedy drafts) |
 | `EXL3_MOE_CPU_SWAP_MIDSTREAM_MAX` | 96 | expert swaps per sweep between forward passes of a long generation (`EXL3_MOE_CPU_SWAP_MIDSTREAM=0`: only between generations) |
 | `EXL3_MMAP_THRESHOLD` | 1048576 | host allocations of at least this many bytes get their own mapping (returned to the OS on free); 0 = glibc default |
@@ -491,6 +511,7 @@ verification from ~45 ms to ~14 ms per round.
 | `vram.py <ctx> <kv_bits> <draft_kv_bits>` | VRAM per component |
 | `gen_check.py -m <model> [--mtp] [--task edit] [--temp T]`, `gen_check_mt.py` | generation fidelity at long context: generated tokens vs the argmax of a chunked-prefill reference, per window (flat ~0.975 greedy when healthy); `_mt`: multi-turn with recurrent-state restore |
 | `speed_ab.py -m <model> [--task edit] [--seeds 1,2,3]` | paired decode-speed A/B of Gumbel coupling and prompt lookup in one process |
+| `prefill_bench.py -m <model> [--chunk N] [--mtp]` | prefill tok/s through the Generator on fresh prompts, with n-gram prefetch hit counts |
 | `dist_check.py -m <model>` | token-distribution check of coupled vs uncoupled speculative sampling |
 | `iqbench_data.py`, `iqbench.py <url> <name>` | capability benchmark through an OpenAI endpoint: MMLU-Pro, MATH-500 level 4-5, HumanEval (executed), thinking on, resumable |
 

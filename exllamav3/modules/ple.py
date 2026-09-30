@@ -457,6 +457,16 @@ class PLELayer(Module):
         """
         history, _, _ = self._state_history(self._prepare_ids(input_ids), params)
         self.ple_embedding.prefetch(history)
+        # The generator's prediction of the next prefill chunk: (ids with `avail` tokens of preceding context,
+        # avail). Staged right behind this chunk on the same worker, so the next forward finds its rows ready.
+        # Its history is the last context_len tokens before the chunk plus the chunk, as the carried id state
+        # will hold after this forward
+        nxt = params.get("prefetch_next")
+        if nxt is not None:
+            ids_n, avail = nxt
+            ctx = self.ple_embedding.context_len
+            if avail >= ctx:
+                self.ple_embedding.prefetch(self._prepare_ids(ids_n)[:, avail - ctx:])
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):

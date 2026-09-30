@@ -1,4 +1,6 @@
 from __future__ import annotations
+import os as _os
+_prefetch_next = _os.environ.get("EXL3_NGRAM_PREFETCH_NEXT", "1") != "0"
 import torch
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -1442,6 +1444,20 @@ class Job:
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
+                # The next chunk's token ids (with some preceding context), predicted with the same chunking rules,
+                # so modules with host-side input staging (PLE n-gram rows) can gather them while this chunk runs.
+                # A wrong prediction only costs the staging work
+                if _prefetch_next:
+                    nstart = prefill_end
+                    nend = min((nstart + self.generator.max_chunk_size) // PAGE_SIZE * PAGE_SIZE,
+                               len(seq.sequence_ids) - 1)
+                    if self.generator.recurrent_cache is not None:
+                        last_b = (len(seq.sequence_ids) - 1) // PAGE_SIZE * PAGE_SIZE
+                        if nstart < last_b <= nend:
+                            nend = last_b
+                    if nend > nstart:
+                        a = max(0, nstart - 64)
+                        params["prefetch_next"] = (seq.sequence_ids.torch_slice(a, nend), nstart - a)
                 if self.generator.mtp_draft:
                     # MTP needs the target's post-final-norm state for every prompt token.
                     # Normal prefill stops at the last cache-writing layer, before final norm.

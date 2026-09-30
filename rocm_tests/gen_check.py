@@ -29,6 +29,7 @@ def main():
     ap.add_argument("--window", type = int, default = 256)
     ap.add_argument("--mtp", action = "store_true")
     ap.add_argument("--ndt", type = int, default = 2)
+    ap.add_argument("--chunk", type = int, default = 2048, help = "prefill chunk of the generator (the reference always uses 2048)")
     ap.add_argument("--hist", type = int, default = 0, help = "recurrent rollback history (prompt-lookup window)")
     ap.add_argument("--temp", type = float, default = 0.0, help = "0: greedy; else sample with --topk / --topp")
     ap.add_argument("--topk", type = int, default = 20)
@@ -49,13 +50,14 @@ def main():
     max_history = max(draft_model.caps.get("default_draft_size", 4), args.ndt, args.hist) if draft_model else 0
     q8 = dict(layer_type = CacheLayer_quant, k_bits = 8, v_bits = 8)
     cache = Cache(model, max_num_tokens = args.cache, max_history = max_history, max_batch_size = 1, **q8)
-    model.load(progressbar = False)
+    model.load(progressbar = False, max_chunk_size = max(2048, args.chunk))
     if draft_model is not None:
         draft_cache = Cache(draft_model, max_num_tokens = args.cache, **q8)
         draft_model.load(progressbar = False)
     tok = Tokenizer.from_config(config)
     gen = Generator(model = model, cache = cache, tokenizer = tok, draft_model = draft_model,
-                    draft_cache = draft_cache, num_draft_tokens = args.ndt if args.mtp else None)
+                    draft_cache = draft_cache, num_draft_tokens = args.ndt if args.mtp else None,
+                    max_chunk_size = args.chunk)
     text = open(os.path.expanduser("~/wikitext2_test.txt")).read()
     parts = [tok.encode("<|im_start|>user\nRead this:\n", encode_special_tokens = True)]
     if args.task == "edit":
