@@ -130,6 +130,7 @@ def _causal_conv1d_update_slotted_output_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    X_CL: tl.constexpr = False,
 ):
     pid_b = tl.program_id(0)
     pid_d = tl.program_id(1)
@@ -155,12 +156,17 @@ def _causal_conv1d_update_slotted_output_kernel(
                 mask = mask_d[:, None] & mask_s[None, :] & (src_t[None, :] < conv_kernel_size),
                 other = 0.0,
             )
+            if X_CL:
+                # x is a (bsz, dim, seq) view of a (bsz, seq, dim) tensor: channels are contiguous
+                x_ptrs = x + (pid_b * seq_len + x_t[None, :]) * dim + offs_d[:, None]
+            else:
+                x_ptrs = x + (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :]
             x_vals = tl.load(
-                x + (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :],
+                x_ptrs,
                 mask = mask_d[:, None] & mask_s[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
                 other = 0.0,
             )
-            vals = tl.where(from_x[None, :], x_vals, state_vals)
+            vals = tl.where(from_x[None, :], x_vals.to(tl.float32), state_vals.to(tl.float32))
             w = tl.load(weight + offs_d * conv_kernel_size + k, mask = mask_d, other = 0.0)
             acc += vals * w[:, None]
 
@@ -195,6 +201,7 @@ def _causal_conv1d_update_slotted_state_kernel(
     history: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_STATE: tl.constexpr,
+    X_CL: tl.constexpr = False,
 ):
     pid_b = tl.program_id(0)
     pid_d = tl.program_id(1)
@@ -220,12 +227,17 @@ def _causal_conv1d_update_slotted_state_kernel(
         mask = mask_d[:, None] & valid_state[None, :] & (src_t[None, :] >= 0) & (src_t[None, :] < conv_kernel_size),
         other = 0.0,
     )
+    if X_CL:
+        x_ptrs = x + (pid_b * seq_len + x_t[None, :]) * dim + offs_d[:, None]
+    else:
+        x_ptrs = x + (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :]
     x_vals = tl.load(
-        x + (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :],
+        x_ptrs,
         mask = mask_d[:, None] & valid_state[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
         other = 0.0,
     )
-    new_state = tl.where(from_x[None, :], x_vals, state_vals)
+    new_state = tl.where(from_x[None, :], x_vals.to(tl.float32), state_vals.to(tl.float32)) \
+        .to(conv_state.dtype.element_ty)
     tl.store(
         conv_state + (slot * dim + offs_d[:, None]) * state_size + offs_state[None, :],
         new_state,
@@ -244,7 +256,13 @@ def causal_conv1d_update_slotted_triton(
 ) -> torch.Tensor:
     if not x.is_cuda:
         raise RuntimeError("causal_conv1d_update_slotted_triton requires CUDA tensors")
-    if not x.is_contiguous() or not conv_state.is_contiguous() or not weight.is_contiguous():
+    # A (bsz, dim, seq) transposed view of a contiguous (bsz, seq, dim) tensor is read in place by the long-sequence
+    # kernels (no transpose copy); its dtype may differ from the state's (converted in the kernel)
+    bsz_, dim_, seq_ = x.shape
+    x_cl = seq_ > 256 and x.stride() == (seq_ * dim_, 1, dim_)
+    if not x_cl and not x.is_contiguous():
+        x = x.contiguous()
+    if not x.is_contiguous() and not x_cl or not conv_state.is_contiguous() or not weight.is_contiguous():
         raise RuntimeError("causal_conv1d_update_slotted_triton requires contiguous x, conv_state, and weight")
     if conv_state.device != x.device:
         raise RuntimeError(f"conv_state is on {conv_state.device}, expected {x.device}")
@@ -271,7 +289,7 @@ def causal_conv1d_update_slotted_triton(
     if state_size < conv_kernel_size:
         raise ValueError("conv_state must have at least conv_kernel_size entries")
     out_shape = (bsz, seq_len, dim) if transpose_output else (bsz, dim, seq_len)
-    out = torch.empty(out_shape, dtype = x.dtype, device = x.device)
+    out = torch.empty(out_shape, dtype = conv_state.dtype, device = x.device)
     block_d = 32
     block_k = triton.next_power_of_2(conv_kernel_size)
     block_state = triton.next_power_of_2(state_size)
@@ -319,6 +337,7 @@ def causal_conv1d_update_slotted_triton(
                 BLOCK_D = block_d,
                 BLOCK_S = block_s,
                 BLOCK_K = block_k,
+                X_CL = x_cl,
                 num_warps = 4,
             )
             state_grid = (bsz, triton.cdiv(dim, block_d))
@@ -333,6 +352,7 @@ def causal_conv1d_update_slotted_triton(
                 history,
                 BLOCK_D = block_d,
                 BLOCK_STATE = block_state,
+                X_CL = x_cl,
                 num_warps = 4,
             )
     return out

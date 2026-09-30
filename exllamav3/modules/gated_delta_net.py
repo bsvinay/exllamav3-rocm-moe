@@ -20,6 +20,8 @@ _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
 _bc_gdn_enable = os.environ.get("EXL3_BC_GDN", "1") != "0"
 _rewind_cache_enable = os.environ.get("EXL3_REWIND_CACHE", "1") != "0"
 from ..model.model_tp_shared import TPTensorWrapper
+import os as _os
+_conv_cl = _os.environ.get("EXL3_GDN_CONV_CL", "1") != "0"
 from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 from ..cache.recurrent import (
     mp_cache_recurrent_stash,
@@ -1161,7 +1163,12 @@ class GatedDeltaNet(Module):
             b = self.b_proj.forward(x, params)
             a = self.a_proj.forward(x, params)
 
-            mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            # Long chunks: the conv kernel reads the (bsz, seq, dim) projection in place through a transposed view
+            # and converts in-kernel; the transpose + bf16 copy cost more than the convolution itself
+            if seqlen > 256 and _conv_cl:
+                mixed_qkv = qkv.transpose(1, 2)
+            else:
+                mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
 
             beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
             g = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
