@@ -180,7 +180,13 @@ transposed to channels-first and converted to bf16 for the conv kernel (two stri
 8192 tokens, the conv itself 0.7 ms). The long-sequence conv kernels now read the projection in place through the
 transposed view and convert in the kernel (`EXL3_GDN_CONV_CL`, default on): 15.3 -> 0.7 ms per layer, ~0.5 s per
 8192-token chunk. The conv state is bit-identical; outputs differ by at most one bf16 step, the input no longer being
-rounded to bf16 before the convolution. 32K-token prompts: ~1,030-1,130 tok/s.
+rounded to bf16 before the convolution.
+
+With the n-gram rows warm in the page cache (`prefill_bench.py --warm`; comparing configurations on cold rows
+mostly measures the SSD), the chunk is bound by GPU work. The batched expert tier's down projection now writes fp16
+(the per-expert path's precision) with the routing weights applied in fp32 before the accumulation
+(`EXL3_MOE_RECON_DOWN_HALF`): rocBLAS runs its fp32-output GEMM on a SIMD kernel and the fp16-output one on the
+matrix cores. 32K-token prompts, warm: 1,325 -> 1,415 tok/s.
 
 Host memory: every prefill stashes recurrent checkpoints (~3 MB per GDN layer each) that are freed again on eviction.
 On glibc's brk heap those freed chunks stayed resident, so the server's anonymous RSS grew by ~0.3-0.5 GB per
@@ -492,6 +498,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_NOGRAPH` | - (`mlp,gdn` in `run_tabbyapi.sh`) | modules (`mlp`, `gdn`, `moe`, `attn`) that decode eagerly instead of through a HIP graph; MoE models with CPU experts need `moe` |
 | `EXL3_WATCHDOG_S` | 300 | a generator iteration running longer than this dumps all stacks and exits the process (0 = off) |
 | `EXL3_MTP_LOOKUP`, `EXL3_MTP_LOOKUP_MAX` | 0, 5 | prompt lookup beside MTP drafting: minimum suffix match (0 = off) and draft length |
+| `EXL3_MOE_RECON_DOWN_HALF` | 1 | batched expert down projection in fp16 (matrix-core GEMM), accumulated in fp32 |
 | `EXL3_GDN_CONV_CL` | 1 | long-sequence DeltaNet conv reads the projection in place (no transpose / bf16 copies) |
 | `EXL3_NGRAM_PREFETCH_NEXT` | 1 | stage the next prefill chunk's n-gram rows while the current chunk runs |
 | `EXL3_MTP_COUPLED` | 1 | Gumbel-coupled MTP drafts under sampling (0 = greedy drafts) |
@@ -521,7 +528,7 @@ verification from ~45 ms to ~14 ms per round.
 | `gen_check.py -m <model> [--mtp] [--task edit] [--temp T]`, `gen_check_mt.py` | generation fidelity at long context: generated tokens vs the argmax of a chunked-prefill reference, per window (flat ~0.975 greedy when healthy); `_mt`: multi-turn with recurrent-state restore |
 | `speed_ab.py -m <model> [--task edit] [--seeds 1,2,3]` | paired decode-speed A/B of Gumbel coupling and prompt lookup in one process |
 | `kprof_prefill.py -m <model> [--chunk N]` | kernel and aten-op profile (with shapes) of one prefill chunk |
-| `prefill_bench.py -m <model> [--chunk N] [--mtp]` | prefill tok/s through the Generator on fresh prompts, with n-gram prefetch hit counts |
+| `prefill_bench.py -m <model> [--chunk N] [--mtp] [--warm]` | prefill tok/s through the Generator on fresh prompts, with n-gram prefetch hit counts |
 | `dist_check.py -m <model>` | token-distribution check of coupled vs uncoupled speculative sampling |
 | `iqbench_data.py`, `iqbench.py <url> <name>` | capability benchmark through an OpenAI endpoint: MMLU-Pro, MATH-500 level 4-5, HumanEval (executed), thinking on, resumable |
 

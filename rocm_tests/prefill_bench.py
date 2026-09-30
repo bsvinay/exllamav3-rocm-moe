@@ -16,6 +16,7 @@ def main():
     ap.add_argument("--len", type = int, default = 16384)
     ap.add_argument("--runs", type = int, default = 3)
     ap.add_argument("--mtp", action = "store_true")
+    ap.add_argument("--warm", action = "store_true", help = "run every prompt once untimed first (warm n-gram page cache)")
     args = ap.parse_args()
     config = Config.from_directory(args.model)
     config.infer_params.moe_cpu_split = args.mcs
@@ -34,7 +35,9 @@ def main():
                     num_draft_tokens = 2 if draft else None, max_chunk_size = args.chunk)
     text = tok.encode(open(os.path.expanduser("~/wikitext2_test.txt")).read())
     ple = [m for m in model.modules if type(m).__name__ == "PLELayer"]
-    for r in range(args.runs):
+    passes = [False, True] if args.warm else [True]
+    for timed in passes:
+      for r in range(args.runs):
         off = 1000 + r * (args.len + 512)
         ids = text[:, off:off + args.len]
         job = Job(input_ids = ids, max_new_tokens = 1, sampler = ComboSampler(temperature = 0.0, top_k = 1), stop_conditions = [])
@@ -45,8 +48,13 @@ def main():
                 if first is None and res.get("token_ids") is not None and res["token_ids"].numel():
                     first = time.perf_counter()
         dt = (first or time.perf_counter()) - t0
-        stats = ple[0].ple_embedding.prefetch_stats if ple else {}
-        print(f"run {r}: {args.len} tokens in {dt:.2f} s -> {args.len / dt:.0f} tok/s  ngram prefetch {dict(stats)}", flush = True)
+        # forget cached pages and recurrent checkpoints: a repeated prompt (the --warm pass) must prefill again
+        gen.pagetable.reset_page_table()
+        if getattr(gen, "recurrent_cache", None) is not None:
+            gen.recurrent_cache.clear()
+        if timed:
+            stats = ple[0].ple_embedding.prefetch_stats if ple else {}
+            print(f"run {r}: {args.len} tokens in {dt:.2f} s -> {args.len / dt:.0f} tok/s  ngram prefetch {dict(stats)}", flush = True)
 
 if __name__ == "__main__":
     main()

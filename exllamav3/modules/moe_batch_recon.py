@@ -50,6 +50,8 @@ PAD_MAX = float(os.environ.get("EXL3_MOE_RECON_PAD", 1.1))
 # reproducible, up to B launches per group) or a single atomic index_add_ over the padded slab.
 # Follows EXL3_MOE_FUSED_DET unless EXL3_MOE_RECON_DET is set explicitly
 DETERMINISTIC = os.environ.get("EXL3_MOE_RECON_DET", os.environ.get("EXL3_MOE_FUSED_DET", "0")) != "0"
+# Down projection of the non-slot (index_add) mode in fp16, weights applied in fp32 (EXL3_MOE_RECON_DOWN_HALF=0: fp32 GEMM)
+DOWN_HALF = os.environ.get("EXL3_MOE_RECON_DOWN_HALF", "1") != "0"
 
 # act(g, u) -> a kernels; gateless relu2 rides relu_mul(u, u, a) = relu2(u)
 _ACT_CALLS_GATED = {
@@ -293,6 +295,15 @@ class BatchReconLayer:
         if out_slab is not None:
             assert nd == out_slab.shape[1], "slot scratch width must match the down projection"
             self._linear(u, Wd, "d", ids_d, nd, out_dtype = torch.float, out = out_slab.view(B, cmax, nd))
+            return
+        if DOWN_HALF and not DETERMINISTIC:
+            # fp16 down output (the per-expert DQ path's precision): rocBLAS picks matrix-core kernels for the
+            # half-output GEMM, not the SIMD one it uses for fp32 output (1.3-2.6x at these shapes); the routing
+            # weight multiply promotes to fp32 for the accumulation
+            d = self._linear(u, Wd, "d", ids_d, nd, out_dtype = torch.half)
+            d2 = d.view(B * cmax, nd)
+            ho = out_ext.shape[1]
+            out_ext.index_add_(0, tok, d2[:, :ho] * w.float().unsqueeze(1))
             return
         d = self._linear(u, Wd, "d", ids_d, nd, out_dtype = torch.float)
         d2 = d.view(B * cmax, nd)
